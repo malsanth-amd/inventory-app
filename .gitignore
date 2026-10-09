@@ -1,0 +1,22 @@
+# Virtualenv (183 MB — rebuilt by start.bat / start.sh from requirements.txt)
+.venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Secrets: SMTP relay credentials and admin passwords. See .env.example.
+.env
+
+# Live data — lab inventory, admin password hashes, SQLite database.
+# The real data directory is set by INVENTORY_DATA_DIR (currently C:\inventory).
+data/
+inventory.json
+*.db
+*.db-shm
+*.db-wal
+*.bak
+
+# Local scratch
+tmp-*/
+*.log
