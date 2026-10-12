@@ -1,0 +1,44 @@
+mindmap
+  root((Bulk RCD/PMIC Endpoint))
+    WHY
+      2023 of 9402 DIMM rows still blank
+      Loop ran 02:28 to 02:31 then stopped at 7379
+      Only 117 unique part numbers in the whole table
+      Same PN filled on 63 rows, blank on 19
+      Decoder is fine - all 8 missing PNs decode OK
+    SERVER - server.py
+      Route POST /api/items/bulk-rcd-pmic
+        Guard _require_admin
+        Actor from _sessions for modified_by
+        Body model BulkRcdPmicIn
+          updates dict of part_number to rcd and pmic
+        Returns updated count and per-PN breakdown
+      Helper _bulk_update_rcd_pmic
+        One _DB_LOCK, one BEGIN IMMEDIATE
+        executemany over ~32 PN rows
+        UPDATE items SET rcd, pmic, updatedAt, modified_by
+        WHERE part_number = ? AND lower category LIKE dimm
+        Fill-only clause so manual edits survive
+          AND rcd = '' AND pmic = ''
+        Commit once, report conn.total_changes
+    CLIENT - static/index.html
+      Delete the sequential PUT loop
+        _applyRcdPmicToItems lines 1628 to 1644
+        Drop stale full-table-rewrite comment
+      Send lookupResults as one POST
+      Re-fetch /api/items on success
+      renderTable once at the end
+      Surface errors instead of empty catch
+      Keep localStorage PN cache untouched
+    GUARDS
+      Skip entries where rcd and pmic are both blank
+      WARNING and ERROR already stripped by _clean
+      Reject payload over a sane PN count
+      Idempotent - safe to re-run any time
+      No schema change needed
+    PAYOFF
+      1 request instead of 2023 round trips
+      1 transaction instead of 2023 commits
+      Sub-second instead of ~10 minutes
+      Closing the tab can no longer leave half the table blank
+      Progress no longer depends on the browser staying open

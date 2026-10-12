@@ -1994,6 +1994,23 @@
     return fallback;
   }
 
+  // A PUT carries the caller's whole copy of a row, so the server has to know
+  // which version that copy came from. Without the header, two admins editing
+  // different fields of the same item silently overwrite one another — the
+  // second save wins and the first change vanishes with no warning.
+  function putItem(itemOrId, body) {
+    const id   = typeof itemOrId === 'string' ? itemOrId : itemOrId.id;
+    const prev = typeof itemOrId === 'string' ? items.find(i => i.id === id) : itemOrId;
+    const headers = prev?.updatedAt ? { 'X-Expected-Updated-At': prev.updatedAt } : {};
+    return apiFetch(`${API}/${id}`, { method: 'PUT', headers, body: JSON.stringify(body) })
+      .catch(err => {
+        // 409: someone else saved first. Pull their version in straight away so
+        // the table stops showing the copy that was just rejected.
+        if (err.status === 409) loadItems(true);
+        throw err;
+      });
+  }
+
   async function apiFetch(url, opts = {}) {
     setSyncing('syncing');
     const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
@@ -2007,7 +2024,9 @@
       }
       if (!res.ok) {
         const err = await res.json().catch(() => ({ detail: res.statusText }));
-        throw new Error(formatApiError(err.detail, res.statusText));
+        const error = new Error(formatApiError(err.detail, res.statusText));
+        error.status = res.status;   // callers branch on 409 (edit conflict)
+        throw error;
       }
       setSyncing('ok');
       clearError();
@@ -2402,7 +2421,7 @@
       body.checkout_date  = '';
       body.loan_until     = '';
       delete body.id; delete body.createdAt; delete body.updatedAt; delete body.modified_by;
-      const updated = await apiFetch(`${API}/${id}`, { method: 'PUT', body: JSON.stringify(body) });
+      const updated = await putItem(item, body);
       items[items.findIndex(i => i.id === id)] = updated;
       renderTable();
       showToast(`"${item.name}" returned successfully.`);
@@ -2428,7 +2447,7 @@
         body.checkout_date  = '';
         body.loan_until     = '';
         delete body.id; delete body.createdAt; delete body.updatedAt; delete body.modified_by;
-        const updated = await apiFetch(`${API}/${id}`, { method: 'PUT', body: JSON.stringify(body) });
+        const updated = await putItem(item, body);
         items[items.findIndex(i => i.id === id)] = updated;
       }
       selectedIds.clear();
@@ -2505,7 +2524,7 @@
         body.loan_until     = loanUntil;
         body.notes          = notes;
         delete body.id; delete body.createdAt; delete body.updatedAt; delete body.modified_by;
-        const updated = await apiFetch(`${API}/${id}`, { method: 'PUT', body: JSON.stringify(body) });
+        const updated = await putItem(item, body);
         items[items.findIndex(i => i.id === id)] = updated;
       }
       const count     = checkoutTargetIds.length;
@@ -2676,7 +2695,7 @@
         if (r.location) body.location = r.location;
         if (r.tray)     body.tray     = r.tray;
         delete body.id; delete body.createdAt; delete body.updatedAt; delete body.modified_by;
-        const updated = await apiFetch(`${API}/${item.id}`, { method: 'PUT', body: JSON.stringify(body) });
+        const updated = await putItem(item, body);
         items[items.findIndex(i => i.id === item.id)] = updated;
         ok++;
       } catch { fail++; }
@@ -2811,7 +2830,7 @@
     btn.disabled = true; btn.textContent = 'Saving…';
     try {
       if (editingId) {
-        const updated = await apiFetch(`${API}/${editingId}`, { method: 'PUT', body: JSON.stringify(body) });
+        const updated = await putItem(editingId, body);
         items[items.findIndex(i => i.id === editingId)] = updated;
         showToast('Item updated.');
       } else {

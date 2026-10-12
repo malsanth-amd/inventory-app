@@ -31,7 +31,7 @@ try:
 except ImportError:
     _HAS_MSOFFCRYPTO = False
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Response, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse
@@ -950,12 +950,32 @@ def create_items_batch(body: BatchIn, creds: HTTPAuthorizationCredentials | None
 
 
 @app.put("/api/items/{item_id}")
-def update_item(item_id: str, body: ItemIn, creds: HTTPAuthorizationCredentials | None = Depends(bearer)):
+def update_item(
+    item_id: str,
+    body: ItemIn,
+    creds: HTTPAuthorizationCredentials | None = Depends(bearer),
+    expected_updated_at: str | None = Header(default=None, alias="X-Expected-Updated-At"),
+):
     _require_admin(creds)
     actor = _sessions.get(creds.credentials, "") if creds else ""
     existing = _get_item(item_id)
     if existing is None:
         raise HTTPException(status_code=404, detail="Item not found")
+
+    # Optimistic concurrency. Every PUT carries the client's whole copy of the
+    # row, so two admins editing different fields of the same item used to end
+    # with the second save silently discarding the first. When the caller tells
+    # us which version it read, a mismatch is refused instead.
+    if expected_updated_at and expected_updated_at != existing.get("updatedAt", ""):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"This item was changed by {existing.get('modified_by') or 'someone else'} "
+                "while you were editing it. Reload and reapply your change so theirs "
+                "is not overwritten."
+            ),
+        )
+
     if not _borrower_is_contactable(body, existing):
         raise HTTPException(status_code=422, detail=_uncontactable_detail(body.checkout_user))
     changes = {**body.model_dump(), "updatedAt": _now()}
