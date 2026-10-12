@@ -8,3 +8,6 @@ msoffcrypto-tool>=5.4.0
 python-multipart>=0.0.12
 pandas>=2.0.0
 xlrd>=2.0.1
+
+# Test suite (pytest -q). Not needed to run the server.
+pytest>=8.0.0

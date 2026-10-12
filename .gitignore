@@ -20,3 +20,6 @@ inventory.json
 # Local scratch
 tmp-*/
 *.log
+
+# pytest cache
+.pytest_cache/
