@@ -488,6 +488,43 @@
     /* Loans view */
     .loans-view { display: none; }
     .loans-view.active { display: block; }
+
+    /* ── reports ── */
+    .report-stats {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 12px; margin-bottom: 22px;
+    }
+    .report-stat {
+      display: flex; flex-direction: column; gap: 2px; padding: 14px 16px;
+      border: 1px solid var(--border); border-radius: var(--radius);
+      background: var(--surface);
+    }
+    .report-stat-value {
+      font-size: 1.6rem; font-weight: 700; line-height: 1.1;
+      font-variant-numeric: tabular-nums;
+    }
+    .report-stat-label {
+      font-size: 0.72rem; font-weight: 600; letter-spacing: 0.06em;
+      text-transform: uppercase; color: var(--muted);
+    }
+    .report-card {
+      margin-bottom: 20px; padding: 16px 18px;
+      border: 1px solid var(--border); border-radius: var(--radius);
+      background: var(--surface);
+    }
+    .report-card h3 { font-size: 0.95rem; margin: 0 0 2px; }
+    .report-note { font-size: 0.8rem; color: var(--muted); margin: 0 0 10px; }
+    .report-table { width: 100%; border-collapse: collapse; font-size: 0.86rem; }
+    .report-table th {
+      text-align: left; font-size: 0.72rem; font-weight: 700;
+      letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted);
+      padding: 6px 10px 6px 0; border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    .report-table td {
+      padding: 6px 10px 6px 0; border-bottom: 1px solid var(--border2);
+    }
+    .report-table tbody tr:last-child td { border-bottom: none; }
     .loans-group { margin-bottom: 20px; border-radius: var(--radius); border: 1px solid var(--border); overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
     .loans-group-header {
       font-size: 0.82rem; font-weight: 700; padding: 10px 16px;
@@ -752,6 +789,7 @@
     <button class="view-tab active" id="tab-inventory" onclick="switchView('inventory')">&#128230; Inventory</button>
     <button class="view-tab" id="tab-loans" onclick="switchView('loans')" style="display:none">&#128197; Loans <span class="tab-badge" id="loans-badge" style="display:none">0</span></button>
     <button class="view-tab" id="tab-bulkco" onclick="switchView('bulkco')" style="display:none">&#128260; Bulk Check In/Out</button>
+    <button class="view-tab" id="tab-reports" onclick="switchView('reports')" style="display:none">&#128202; Reports</button>
     <button class="view-tab" id="tab-submit" onclick="switchView('submit')">&#128196; Submit Request</button>
     <button class="view-tab" id="tab-creds" onclick="switchView('creds')" style="display:none">&#128274; Credentials</button>
   </div>
@@ -768,6 +806,10 @@
   </div>
 
   <!-- Bulk Check In / Check Out view -->
+  <div class="loans-view" id="reports-view">
+    <div id="reports-body"><div class="loading-row">Loading…</div></div>
+  </div>
+
   <div class="bulkco-view" id="bulkco-view">
     <div class="bulkco-layout">
 
@@ -2174,6 +2216,7 @@
     document.getElementById('bulk-lookup-btn').style.display       = admin ? '' : 'none';
     document.getElementById('tab-loans').style.display            = admin ? '' : 'none';
     document.getElementById('tab-bulkco').style.display           = admin ? '' : 'none';
+    document.getElementById('tab-reports').style.display          = admin ? '' : 'none';
     document.getElementById('tab-creds').style.display            = admin ? '' : 'none';
     document.getElementById('tab-submit').style.display           = admin ? 'none' : '';
     document.getElementById('field-location').style.display            = admin ? '' : 'none';
@@ -3567,19 +3610,148 @@
   // ── view switching ─────────────────────────────────────────────────────────
   let currentView = 'inventory';
 
+  // ── reports ─────────────────────────────────────────────────────────────────
+  //
+  // Counts come from GROUP BY in SQLite rather than from the item array the
+  // browser already holds: these are whole-table questions, and computing them
+  // here would mean the client could only ever report on the page it has.
+
+  const _GAP_LABELS = {
+    no_location:            'Items with no location recorded',
+    no_part_number:         'Items with no part number',
+    no_serial:              'Items with no serial number',
+    dimms_without_rcd:      'DIMMs with no RCD vendor',
+    dimms_without_speed:    'DIMMs with no speed',
+    checkout_without_email: 'Check-outs with no email (cannot be reminded)',
+    checkout_without_date:  'Check-outs with no start date',
+    checkout_without_due:   'Check-outs with no due date (never show as overdue)',
+  };
+
+  function _reportTable(headers, rows, emptyText) {
+    if (!rows.length) return `<p style="color:var(--muted);font-size:0.86rem">${esc(emptyText)}</p>`;
+    return `<table class="report-table">
+      <thead><tr>${headers.map((h, n) =>
+        `<th${n ? ' style="text-align:right"' : ''}>${esc(h)}</th>`).join('')}</tr></thead>
+      <tbody>${rows.map(cells => `<tr>${cells.map((c, n) =>
+        `<td${n ? ' style="text-align:right;font-variant-numeric:tabular-nums"' : ''}>${c}</td>`
+      ).join('')}</tr>`).join('')}</tbody></table>`;
+  }
+
+  function _reportCard(title, inner, note) {
+    return `<section class="report-card">
+      <h3>${esc(title)}</h3>
+      ${note ? `<p class="report-note">${esc(note)}</p>` : ''}
+      ${inner}
+    </section>`;
+  }
+
+  async function renderReportsView() {
+    const el = document.getElementById('reports-body');
+    el.innerHTML = '<div class="loading-row">Loading…</div>';
+    let d;
+    try {
+      d = await apiFetch('/api/reports/summary');
+    } catch (e) {
+      el.innerHTML = `<p style="color:var(--danger)">Could not load reports: ${esc(e.message)}</p>`;
+      return;
+    }
+
+    const t = d.totals;
+    const pct = n => t.items ? `${(100 * n / t.items).toFixed(1)}%` : '—';
+
+    const headline = `<div class="report-stats">
+      ${[['Items', t.items], ['Available', t.available],
+         ['Checked out', t.checked_out], ['Distinct part numbers', t.part_numbers]]
+        .map(([label, value]) => `<div class="report-stat">
+            <span class="report-stat-value">${value.toLocaleString()}</span>
+            <span class="report-stat-label">${esc(label)}</span>
+          </div>`).join('')}
+    </div>`;
+
+    const byCategory = _reportTable(
+      ['Category', 'Total', 'Available', 'Checked out', '% of stock'],
+      d.by_category.map(c => [esc(c.category || '(none)'), c.total, c.available,
+                              c.checked_out, pct(c.total)]),
+      'No items.');
+
+    const byTeam = _reportTable(
+      ['Team', 'Total', 'Checked out'],
+      d.by_team.map(t2 => [esc(t2.team), t2.total, t2.checked_out]),
+      'No teams recorded.');
+
+    const borrowers = _reportTable(
+      ['Borrower', 'Items', 'Contactable', 'Earliest check-out'],
+      d.borrowers.map(b => [
+        esc(b.checkout_user),
+        b.items,
+        b.without_email === b.items ? '<span style="color:var(--danger)">none</span>'
+          : b.without_email ? `${b.items - b.without_email} of ${b.items}` : 'all',
+        esc(b.since || '—'),
+      ]),
+      'Nothing is checked out.');
+
+    const lowStock = _reportTable(
+      ['Part number', 'Example item', 'Available', 'Total'],
+      d.low_stock.map(s => [
+        esc(s.part_number),
+        esc((s.example_name || '').slice(0, 46)),
+        s.available === 0 ? '<span style="color:var(--danger)">0</span>' : s.available,
+        s.total,
+      ]),
+      `Nothing at or below ${d.low_stock_threshold} available.`);
+
+    const mostHeld = _reportTable(
+      ['Part number', 'Example item', 'Total', 'Available'],
+      d.most_held.map(s => [esc(s.part_number),
+                            esc((s.example_name || '').slice(0, 46)), s.total, s.available]),
+      'No part numbers recorded.');
+
+    const overdue = _reportTable(
+      ['Item', 'Borrower', 'Due', 'Email'],
+      d.overdue.map(o => [esc(o.name), esc(o.checkout_user),
+                          `<span style="color:var(--danger)">${esc(o.loan_until)}</span>`,
+                          esc(o.checkout_email || '—')]),
+      'Nothing is past its due date.');
+
+    const gaps = _reportTable(
+      ['Gap', 'Rows'],
+      Object.entries(d.gaps).map(([k, v]) => [
+        esc(_GAP_LABELS[k] || k),
+        v > 0 ? `<strong>${v.toLocaleString()}</strong>` : '0',
+      ]),
+      'No gaps.');
+
+    el.innerHTML = headline
+      + _reportCard('By category', byCategory)
+      + _reportCard('Who has what', borrowers,
+          'A borrower with no email cannot be sent a reminder or a return request.')
+      + _reportCard(`Low stock — ${d.low_stock_threshold} or fewer available`, lowStock,
+          'Part numbers most likely to block someone who needs one today.')
+      + _reportCard('Overdue', overdue)
+      + _reportCard('By team', byTeam)
+      + _reportCard('Largest holdings', mostHeld)
+      + _reportCard('Data gaps', gaps,
+          'Each row is a count of items missing something the system needs to be useful.')
+      + `<p style="color:var(--muted);font-size:0.78rem;margin-top:18px">
+           Generated ${esc(new Date(d.generated_at).toLocaleString())}</p>`;
+  }
+
   function switchView(view) {
     currentView = view;
     document.getElementById('inventory-view').style.display = view === 'inventory' ? '' : 'none';
     document.getElementById('loans-view').classList.toggle('active', view === 'loans');
     document.getElementById('bulkco-view').classList.toggle('active', view === 'bulkco');
+    document.getElementById('reports-view').classList.toggle('active', view === 'reports');
     document.getElementById('submit-view').classList.toggle('active', view === 'submit');
     document.getElementById('creds-view').classList.toggle('active', view === 'creds');
     document.getElementById('tab-inventory').classList.toggle('active', view === 'inventory');
     document.getElementById('tab-loans').classList.toggle('active', view === 'loans');
     document.getElementById('tab-bulkco').classList.toggle('active', view === 'bulkco');
+    document.getElementById('tab-reports').classList.toggle('active', view === 'reports');
     document.getElementById('tab-submit').classList.toggle('active', view === 'submit');
     document.getElementById('tab-creds').classList.toggle('active', view === 'creds');
     if (view === 'loans') renderLoansView();
+    if (view === 'reports') renderReportsView();
     if (view === 'creds' && isSuperAdmin) loadAdminUsers();
   }
 

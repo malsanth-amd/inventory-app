@@ -1025,6 +1025,120 @@ def batch_delete_items(body: BatchDeleteIn):
     return {"deleted": _delete_ids(list(dict.fromkeys(body.ids)))}
 
 
+# ── reporting ─────────────────────────────────────────────────────────────────
+
+# Aggregates run in SQLite rather than over the JSON the browser already holds:
+# the questions below ("how many are available", "what is running low") are
+# GROUP BYs over the whole table, and shipping 9.7k rows to compute them in the
+# client is what the Reports view exists to replace.
+
+_SQL_CHECKED_OUT = "trim(checkout_user) <> ''"
+
+
+@app.get("/api/reports/summary", dependencies=[Depends(_require_admin)])
+def reports_summary(low_stock_threshold: int = Query(default=3, ge=0, le=1000)):
+    """Counts the inventory table can answer but the UI previously could not."""
+    today = _date.today().isoformat()
+
+    with _db_connect() as conn:
+        def rows(sql: str, args: tuple = ()) -> list[dict]:
+            return [dict(r) for r in conn.execute(sql, args).fetchall()]
+
+        def one(sql: str, args: tuple = ()):
+            return conn.execute(sql, args).fetchone()[0]
+
+        by_category = rows(f"""
+            SELECT category,
+                   COUNT(*)                                    AS total,
+                   SUM(CASE WHEN {_SQL_CHECKED_OUT} THEN 1 ELSE 0 END) AS checked_out
+              FROM items
+             GROUP BY category
+             ORDER BY total DESC
+        """)
+        for row in by_category:
+            row["category"] = _normalize_category(row["category"])
+            row["available"] = row["total"] - row["checked_out"]
+
+        by_team = rows(f"""
+            SELECT CASE WHEN trim(team) = '' THEN '(none)' ELSE team END AS team,
+                   COUNT(*)                                    AS total,
+                   SUM(CASE WHEN {_SQL_CHECKED_OUT} THEN 1 ELSE 0 END) AS checked_out
+              FROM items
+             GROUP BY 1
+             ORDER BY total DESC
+             LIMIT 25
+        """)
+
+        # Stock levels per part number — the "do we have any spare?" question.
+        stock = rows(f"""
+            SELECT trim(part_number) AS part_number,
+                   MIN(name)                                   AS example_name,
+                   COUNT(*)                                    AS total,
+                   SUM(CASE WHEN {_SQL_CHECKED_OUT} THEN 0 ELSE 1 END) AS available
+              FROM items
+             WHERE trim(part_number) <> ''
+             GROUP BY 1
+             ORDER BY available ASC, total DESC
+        """)
+        low_stock = [s for s in stock if s["available"] <= low_stock_threshold][:25]
+        most_held = sorted(stock, key=lambda s: -s["total"])[:15]
+
+        borrowers = rows(f"""
+            SELECT checkout_user,
+                   MIN(CASE WHEN trim(checkout_email) <> '' THEN checkout_email END) AS email,
+                   COUNT(*)                                             AS items,
+                   SUM(CASE WHEN trim(checkout_email) = '' THEN 1 ELSE 0 END) AS without_email,
+                   MIN(CASE WHEN trim(checkout_date) <> '' THEN checkout_date END) AS since
+              FROM items
+             WHERE {_SQL_CHECKED_OUT}
+             GROUP BY checkout_user
+             ORDER BY items DESC
+        """)
+
+        overdue = rows(f"""
+            SELECT id, name, part_number, checkout_user, checkout_email, loan_until
+              FROM items
+             WHERE {_SQL_CHECKED_OUT}
+               AND trim(loan_until) <> ''
+               AND loan_until < ?
+             ORDER BY loan_until ASC
+             LIMIT 50
+        """, (today,))
+
+        total = one("SELECT COUNT(*) FROM items")
+        checked_out = one(f"SELECT COUNT(*) FROM items WHERE {_SQL_CHECKED_OUT}")
+
+        # Gaps worth acting on, each phrased as a count of rows.
+        gaps = {
+            "no_location":        one("SELECT COUNT(*) FROM items WHERE trim(location) = ''"),
+            "no_part_number":     one("SELECT COUNT(*) FROM items WHERE trim(part_number) = ''"),
+            "no_serial":          one("SELECT COUNT(*) FROM items WHERE trim(serial_number) = ''"),
+            "dimms_without_rcd":  one("SELECT COUNT(*) FROM items WHERE lower(category) LIKE '%dimm%' AND trim(rcd) = ''"),
+            "dimms_without_speed": one("SELECT COUNT(*) FROM items WHERE lower(category) LIKE '%dimm%' AND trim(speed) = ''"),
+            "checkout_without_email": one(f"SELECT COUNT(*) FROM items WHERE {_SQL_CHECKED_OUT} AND trim(checkout_email) = ''"),
+            "checkout_without_date":  one(f"SELECT COUNT(*) FROM items WHERE {_SQL_CHECKED_OUT} AND trim(checkout_date) = ''"),
+            "checkout_without_due":   one(f"SELECT COUNT(*) FROM items WHERE {_SQL_CHECKED_OUT} AND trim(loan_until) = ''"),
+        }
+
+    return {
+        "generated_at": _now(),
+        "totals": {
+            "items": total,
+            "checked_out": checked_out,
+            "available": total - checked_out,
+            "part_numbers": len(stock),
+        },
+        "by_category": by_category,
+        "by_team": by_team,
+        "borrowers": borrowers,
+        "low_stock": low_stock,
+        "low_stock_threshold": low_stock_threshold,
+        "most_held": most_held,
+        "overdue": overdue,
+        "gaps": gaps,
+    }
+
+
 # ── email reminders ───────────────────────────────────────────────────────────
 
 class ReminderIn(BaseModel):
