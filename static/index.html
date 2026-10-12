@@ -953,7 +953,12 @@
   </div>
 
   <div class="toolbar">
-    <input type="text" id="search" placeholder="Search by name, category, RCD, PMIC…" oninput="_resetPage();renderTable()" />
+    <input type="text" id="search" placeholder="Search by name, category, RCD, PMIC…" oninput="onSearchInput()" />
+    <input type="text" id="scan" placeholder="&#128278; Scan a label…" autocomplete="off"
+           onkeydown="if(event.key==='Enter'){event.preventDefault();onScan();}"
+           title="Put the cursor here and scan a DIMM label. Works with a bare serial or a full (L)…(S)…(P)… barcode."
+           style="max-width:230px" />
+    <span id="scan-status" style="font-size:0.8rem;display:none"></span>
     <button class="btn-primary" id="add-btn" onclick="openModal()" style="display:none">+ Add Item</button>
     <button class="btn-ghost" id="import-btn-toolbar" onclick="openImportModal()" style="display:none">&#11014; Import File</button>
     <button class="btn-ghost" id="export-all-btn" onclick="exportAllXlsx()" style="display:none">&#11015; Export All</button>
@@ -1551,6 +1556,113 @@
     '4Rx8': { 64: '16Gbits', 128: '32Gbits' },
   };
 
+  // ── barcode handling ────────────────────────────────────────────────────────
+  //
+  // DIMM labels carry a 2D barcode in the form
+  //   (L)96GB 4Rx8 PC5-128/64B-MC1-1312-XT(S)80AD0125181289006B(P)HMCGM8AHJMB869N
+  // where (L) is the label text, (S) the serial and (P) the part number. Some
+  // scanners render the literal "(C)" country segment as the © character.
+  //
+  // 97% of stored serial_number values are a whole barcode like this rather than
+  // the serial alone, so matching has to look inside the string: a tech scanning
+  // a bare serial would otherwise never find the row, and matching would fall
+  // through to part number — which hundreds of DIMMs share.
+
+  function parseBarcode(code) {
+    const raw = String(code || '').trim();
+    if (!raw) return null;
+    const seg = id => {
+      const m = raw.match(new RegExp(`\\(${id}\\)(.*?)(?=\\((?:L|S|P|C)\\)|©|$)`, 'i'));
+      return m ? m[1].trim() : '';
+    };
+    const serial = seg('S');
+    if (!serial) return null;
+    return { raw, serial, partNumber: seg('P'), label: seg('L') };
+  }
+
+  // The serial an item is really identified by, whether it is stored bare or
+  // wrapped in a full barcode.
+  function itemSerial(item) {
+    const raw = String(item?.serial_number || '').trim();
+    return (parseBarcode(raw)?.serial || raw).toLowerCase();
+  }
+
+  // Scanned text matches an item if either side is a bare serial and the other
+  // is a barcode containing it, or the two are simply equal.
+  function serialMatches(item, scanned) {
+    const target = String(scanned || '').trim().toLowerCase();
+    if (!target) return false;
+    const stored = String(item?.serial_number || '').trim().toLowerCase();
+    if (!stored) return false;
+    if (stored === target) return true;
+    const scannedSerial = parseBarcode(target)?.serial?.toLowerCase() || target;
+    return itemSerial(item) === scannedSerial;
+  }
+
+  function findItemByScan(code) {
+    const parsed  = parseBarcode(code);
+    const scanned = String(code || '').trim();
+    if (!scanned) return null;
+    const hits = items.filter(i => serialMatches(i, scanned));
+    if (hits.length) return { item: hits[0], ambiguous: hits.length > 1, by: 'serial number' };
+    // Fall back to part number only when the scan carried no serial at all,
+    // and only when it identifies exactly one item.
+    const pn = (parsed?.partNumber || scanned).trim().toLowerCase();
+    const byPn = items.filter(i => (i.part_number || '').trim().toLowerCase() === pn);
+    if (byPn.length === 1) return { item: byPn[0], ambiguous: false, by: 'part number' };
+    if (byPn.length > 1)   return { item: null, ambiguous: true, by: 'part number', count: byPn.length };
+    return null;
+  }
+
+  // A scan adds the item to the existing selection, so the Check Out / Check In
+  // buttons that already appear for selected rows do the rest. Scanning a tray
+  // of DIMMs one after another builds the batch, then one click acts on all of
+  // them — which is how the bench actually works.
+  let _scannedCount = 0;
+
+  function onScan() {
+    const input = document.getElementById('scan');
+    const code  = input.value.trim();
+    input.value = '';
+    input.focus();                    // stay ready for the next scan
+    if (!code) return;
+
+    const hit = findItemByScan(code);
+    if (!hit || !hit.item) {
+      const many = hit && hit.ambiguous;
+      setScanStatus(
+        many ? `${hit.count} items share that part number — scan the serial instead`
+             : `No item matches ${code.length > 28 ? code.slice(0, 28) + '…' : code}`,
+        'err');
+      return;
+    }
+    if (selectedIds.has(hit.item.id)) {
+      setScanStatus(`Already scanned: ${hit.item.name}`, 'warn');
+      return;
+    }
+
+    selectedIds.add(hit.item.id);
+    _scannedCount++;
+    renderTable();
+    updateSelectionUI();
+    const viaPart = hit.by === 'part number' ? ' (matched on part number)' : '';
+    setScanStatus(`✓ ${hit.item.name}${viaPart} — ${_scannedCount} scanned`, 'ok');
+  }
+
+  function setScanStatus(text, kind) {
+    const el = document.getElementById('scan-status');
+    if (!el) return;
+    el.textContent = text;
+    el.style.display = '';
+    el.style.color = kind === 'err' ? 'var(--danger)'
+                   : kind === 'warn' ? 'var(--warn, #d29922)'
+                   : 'var(--primary)';
+    clearTimeout(el._t);
+    el._t = setTimeout(() => { el.style.display = 'none'; }, 6000);
+  }
+
+  function resetScanCount() { _scannedCount = 0; }
+
   function normalizeRank(rank) {
     // Extract and normalize rank from anywhere in the string (2rx4, 2RX4, "2Rx4 RDIMM" → "2Rx4")
     const m = (rank || '').match(/(\d+)[Rr][Xx](\d+)/);
@@ -1648,6 +1760,7 @@
       if (!hit) continue;
       if (hit.rcd  && (overwrite || !item.rcd))  item.rcd  = hit.rcd;
       if (hit.pmic && (overwrite || !item.pmic)) item.pmic = hit.pmic;
+      delete item._blob;   // RCD/PMIC are searchable; drop the stale index
     }
     return res?.updated || 0;
   }
@@ -2002,7 +2115,9 @@
     const id   = typeof itemOrId === 'string' ? itemOrId : itemOrId.id;
     const prev = typeof itemOrId === 'string' ? items.find(i => i.id === id) : itemOrId;
     const headers = prev?.updatedAt ? { 'X-Expected-Updated-At': prev.updatedAt } : {};
-    return apiFetch(`${API}/${id}`, { method: 'PUT', headers, body: JSON.stringify(body) })
+    const payload = { ...body };
+    delete payload._blob;   // cached search index, not a field of the item
+    return apiFetch(`${API}/${id}`, { method: 'PUT', headers, body: JSON.stringify(payload) })
       .catch(err => {
         // 409: someone else saved first. Pull their version in straight away so
         // the table stops showing the copy that was just rejected.
@@ -2205,34 +2320,61 @@
     });
   }
 
+  const _SEARCH_FIELDS = ['vendor','name','part_number','serial_number','category',
+                          'location','tray','team','owner','checkout_user','rcd','pmic'];
+
+  // One lowercased string per item, built once and cached on the item. The
+  // filter used to call .toLowerCase() on twelve fields of every item on every
+  // keystroke — about 117,000 string operations per character typed.
+  function searchBlob(item) {
+    if (item._blob === undefined) {
+      item._blob = _SEARCH_FIELDS.map(f => item[f] || '').join(' ').toLowerCase();
+    }
+    return item._blob;
+  }
+
+  // Values like "64 GB", "1 TB" and "4800 MT/s" are numbers with a unit, but a
+  // plain string sort puts "128 GB" before "32 GB" and "1 TB" before both.
+  // Compare the magnitude when both sides carry one, and fall back to text.
+  const _UNIT_SCALE = { kb: 1e-6, mb: 1e-3, gb: 1, tb: 1e3, pb: 1e6,
+                        gbits: 1, gbit: 1, mt: 1, 'mt/s': 1, mhz: 1 };
+
+  function magnitude(value) {
+    const s = String(value ?? '').trim().toLowerCase();
+    if (!s) return null;
+    const m = s.match(/^([0-9]*\.?[0-9]+)\s*([a-z/]*)/);
+    if (!m) return null;
+    const scale = m[2] ? (_UNIT_SCALE[m[2]] ?? 1) : 1;
+    return parseFloat(m[1]) * scale;
+  }
+
+  function compareValues(a, b) {
+    const av = String(a ?? '').trim();
+    const bv = String(b ?? '').trim();
+    if (!av && !bv) return 0;
+    if (!av) return 1;            // blanks sort last, whichever direction
+    if (!bv) return -1;
+    const an = magnitude(av), bn = magnitude(bv);
+    if (an !== null && bn !== null && an !== bn) return an - bn;
+    return av.toLowerCase().localeCompare(bv.toLowerCase());
+  }
+
+  // Scanner input arrives as a keystroke burst, and a 9.7k-row re-render on
+  // every character is wasted work; wait for a pause instead.
+  let _searchTimer = null;
+  function onSearchInput() {
+    clearTimeout(_searchTimer);
+    _searchTimer = setTimeout(() => { _resetPage(); renderTable(); }, 150);
+  }
+
   function renderTable() {
     const q = document.getElementById('search').value.toLowerCase().trim();
     filtered = [...items];
 
     if (activeFilter !== 'All') filtered = filtered.filter(i => (i.category || '') === activeFilter);
-    if (q) {
-      filtered = filtered.filter(i =>
-        (i.vendor        || '').toLowerCase().includes(q) ||
-        i.name.toLowerCase().includes(q) ||
-        (i.part_number   || '').toLowerCase().includes(q) ||
-        (i.serial_number || '').toLowerCase().includes(q) ||
-        (i.category      || '').toLowerCase().includes(q) ||
-        (i.location      || '').toLowerCase().includes(q) ||
-        (i.tray          || '').toLowerCase().includes(q) ||
-        (i.team          || '').toLowerCase().includes(q) ||
-        (i.owner         || '').toLowerCase().includes(q) ||
-        (i.checkout_user || '').toLowerCase().includes(q) ||
-        (i.rcd           || '').toLowerCase().includes(q) ||
-        (i.pmic          || '').toLowerCase().includes(q)
-      );
-    }
+    if (q) filtered = filtered.filter(i => searchBlob(i).includes(q));
 
-    filtered.sort((a, b) => {
-      const av = (a[sortKey] ?? '').toString().toLowerCase();
-      const bv = (b[sortKey] ?? '').toString().toLowerCase();
-      if (!isNaN(av) && !isNaN(bv)) return (parseFloat(av) - parseFloat(bv)) * sortDir;
-      return av.localeCompare(bv) * sortDir;
-    });
+    filtered.sort((a, b) => compareValues(a[sortKey], b[sortKey]) * sortDir);
 
     // ── pagination ────────────────────────────────────────────────────────────
     _totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
@@ -2452,6 +2594,7 @@
       }
       selectedIds.clear();
       allFilteredSelected = false;
+      resetScanCount();
       renderTable();
       showToast(ids.length === 1 ? `"${names[0]}" checked in.` : `${ids.length} items checked in.`);
     } catch { /* error shown in banner */ }
@@ -2603,7 +2746,9 @@
         const isCheckIn  = !isChangeUser && (action.includes('checkin')  || action === 'in');
         // match inventory item
         let matched = null;
-        if (serial) matched = items.find(it => it.serial_number && it.serial_number.trim().toLowerCase() === serial.toLowerCase());
+        // serialMatches looks inside a stored barcode, so a sheet carrying bare
+        // serials matches rows whose serial_number is a full (L)…(S)…(P)… scan.
+        if (serial) matched = items.find(it => serialMatches(it, serial));
         if (!matched && part) matched = items.find(it => it.part_number && it.part_number.trim().toLowerCase() === part.toLowerCase());
         // A row that names a borrower must carry a usable address: the server
         // refuses it otherwise, and catching it here shows the admin every bad
@@ -3010,7 +3155,9 @@
     for (const ex of existingItems) {
       if (excludeId && ex.id === excludeId) continue;
       if (sn) {
-        if ((ex.serial_number || '').trim().toLowerCase() === sn)
+        // Compare by serial, not by whole string: the same unit scanned bare on
+        // one import and as a full barcode on another is still one unit.
+        if (serialMatches(ex, sn))
           return { item: ex, by: 'serial number' };
       } else {
         const exName = (ex.name || '').trim().toLowerCase();
@@ -3238,6 +3385,7 @@
   function clearAllSelection() {
     allFilteredSelected = false;
     selectedIds.clear();
+    resetScanCount();
     document.querySelectorAll('#table-body input[type="checkbox"]').forEach(c => c.checked = false);
     const allChk = document.getElementById('select-all-chk');
     if (allChk) allChk.checked = false;
@@ -3380,6 +3528,7 @@
       items = items.filter(i => !ids.includes(i.id));
       selectedIds.clear();
       allFilteredSelected = false;
+      resetScanCount();
       renderTable();
       showToast(`Deleted ${result.deleted} item${result.deleted !== 1 ? 's' : ''}.`);
     } catch {
