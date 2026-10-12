@@ -881,9 +881,6 @@
             <button class="btn-primary" onclick="doChangePassword()">Update Password</button>
           </div>
         </div>
-        <div id="dev-fixed-notice" style="display:none;font-size:0.83rem;color:var(--muted);padding:10px 0">
-          &#128274; Developer account credentials are fixed and cannot be changed.
-        </div>
       </div>
 
     </div>
@@ -1262,8 +1259,9 @@
           <input type="text" id="co-user" placeholder="e.g. John Doe" style="width:100%" />
         </div>
         <div>
-          <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:4px;color:var(--text)">Email <span style="color:var(--muted);font-weight:400">(optional)</span></label>
+          <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:4px;color:var(--text)">Email <span style="color:var(--danger)">*</span></label>
           <input type="email" id="co-email" placeholder="e.g. john@amd.com" style="width:100%" />
+          <div style="font-size:0.72rem;color:var(--muted);margin-top:3px">Needed to send loan reminders and return requests.</div>
         </div>
       </div>
       <!-- Dates section -->
@@ -1612,44 +1610,64 @@
     }
   }
 
-  async function _applyRcdPmicToItems(dimsWithPN, lookupResults) {
+  // overwrite=false (background auto-fill): only blank columns are filled.
+  // overwrite=true  (manual Lookup button): decoder values replace what is stored.
+  async function _applyRcdPmicToItems(dimsWithPN, lookupResults, overwrite = false) {
     if (!isAdmin) return 0;
 
-    // Build list of items that actually need updating
-    const toUpdate = dimsWithPN.reduce((acc, item) => {
-      const hit = lookupResults[item.part_number.trim()];
-      if (!hit) return acc;
-      const newRcd  = hit.rcd  || item.rcd;
-      const newPmic = hit.pmic || item.pmic;
-      if (newRcd !== item.rcd || newPmic !== item.pmic) acc.push({ item, newRcd, newPmic });
-      return acc;
-    }, []);
-
-    // Process sequentially — server uses full-table rewrite per PUT so concurrency causes failures
-    let updated = 0;
-    for (const { item, newRcd, newPmic } of toUpdate) {
-      try {
-        const body = { ...item, rcd: newRcd, pmic: newPmic };
-        delete body.id; delete body.createdAt; delete body.updatedAt; delete body.modified_by;
-        const res = await fetch(`${API}/${item.id}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${sessionStorage.getItem('inv_token')}` },
-          body: JSON.stringify(body),
-        });
-        if (!res.ok) continue;
-        const saved = await res.json();
-        items[items.findIndex(i => i.id === item.id)] = saved;
-        updated++;
-      } catch {}
+    // Send part numbers, not rows: the decoder answers per PN, and the server
+    // updates every row sharing it inside one transaction. Only PNs that would
+    // actually change something are included, so a repeat run sends nothing.
+    const updates = {};
+    for (const item of dimsWithPN) {
+      const pn  = item.part_number.trim();
+      const hit = lookupResults[pn];
+      if (!hit) continue;
+      const changesRcd  = hit.rcd  && (overwrite ? hit.rcd  !== item.rcd  : !item.rcd);
+      const changesPmic = hit.pmic && (overwrite ? hit.pmic !== item.pmic : !item.pmic);
+      if (changesRcd || changesPmic) {
+        updates[pn] = { rcd: hit.rcd || '', pmic: hit.pmic || '' };
+      }
     }
-    return updated;
+    if (Object.keys(updates).length === 0) return 0;
+
+    let res;
+    try {
+      res = await apiFetch('/api/items/bulk-rcd-pmic', {
+        method: 'POST',
+        body: JSON.stringify({ updates, overwrite }),
+      });
+    } catch {
+      return 0;  // apiFetch already surfaced the error
+    }
+
+    // Mirror the server's rule locally so the table updates straight away; the
+    // next poll replaces these rows with the authoritative copy.
+    for (const item of dimsWithPN) {
+      const hit = updates[item.part_number.trim()];
+      if (!hit) continue;
+      if (hit.rcd  && (overwrite || !item.rcd))  item.rcd  = hit.rcd;
+      if (hit.pmic && (overwrite || !item.pmic)) item.pmic = hit.pmic;
+    }
+    return res?.updated || 0;
   }
 
   // Auto-run on page load — silently fills missing RCD/PMIC using cache + decoder
   // Only runs for admin users; skips items that already have both rcd and pmic
+  let _autoLookupRunning = false;
   async function autoLookupRcdPmic() {
-    if (!isAdmin) return;
+    if (!isAdmin || _autoLookupRunning) return;
+    _autoLookupRunning = true;
+    try {
+      await _autoLookupRcdPmic();
+    } finally {
+      _autoLookupRunning = false;
+    }
+  }
 
+  // The 30s poll calls autoLookupRcdPmic on every change, including the one this
+  // makes, so the guard above keeps two runs from overlapping.
+  async function _autoLookupRcdPmic() {
     const dimsWithPN = items.filter(i =>
       i.part_number && i.category?.toLowerCase().includes('dimm') && (!i.rcd || !i.pmic)
     );
@@ -1700,7 +1718,7 @@
       return;
     }
 
-    const updated = await _applyRcdPmicToItems(dimsWithPN, lookupResults);
+    const updated = await _applyRcdPmicToItems(dimsWithPN, lookupResults, true);
     renderTable();
     statusEl.textContent = updated > 0
       ? `✓ Updated ${updated} item(s) across ${Object.keys(lookupResults).length} part number(s)`
@@ -1947,6 +1965,35 @@
     document.getElementById('error-banner').classList.remove('show');
   }
 
+  // FastAPI's `detail` is a plain string for our own HTTPExceptions, but an array
+  // of {loc, msg} objects when a Pydantic validator rejects a field, and an object
+  // for the batch-import report. Without this, all three render as "[object Object]".
+  function formatApiError(detail, fallback = 'Request failed') {
+    if (!detail) return fallback;
+    if (typeof detail === 'string') return detail;
+
+    if (Array.isArray(detail)) {
+      const FIELD_LABELS = {
+        name: 'Item Description', checkout_email: 'Check Out Email',
+        checkout_date: 'Check Out Date', loan_until: 'Loan Until',
+        category: 'Category', checkout_user: 'Check Out User',
+      };
+      return detail.map(e => {
+        // loc is ["body", "<field>"], or just ["body"] for whole-model checks
+        const field = Array.isArray(e.loc) ? e.loc.filter(p => p !== 'body').pop() : null;
+        const msg   = String(e.msg || '').replace(/^Value error,\s*/, '');
+        const label = field ? (FIELD_LABELS[field] || field) : null;
+        return label && !msg.startsWith(label) ? `${label}: ${msg}` : msg;
+      }).join('\n');
+    }
+
+    if (detail.message) {
+      const rows = (detail.rows || []).map(r => `  row ${r.row}: ${r.name}`).join('\n');
+      return detail.message + (rows ? `\n${rows}` : '') + (detail.truncated ? '\n  …and more' : '');
+    }
+    return fallback;
+  }
+
   async function apiFetch(url, opts = {}) {
     setSyncing('syncing');
     const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
@@ -1960,7 +2007,7 @@
       }
       if (!res.ok) {
         const err = await res.json().catch(() => ({ detail: res.statusText }));
-        throw new Error(err.detail || res.statusText);
+        throw new Error(formatApiError(err.detail, res.statusText));
       }
       setSyncing('ok');
       clearError();
@@ -1999,9 +2046,11 @@
     document.getElementById('field-tray').style.display                = admin ? '' : 'none';
     document.getElementById('superadmin-section').style.display      = isSuperAdmin ? '' : 'none';
     document.getElementById('loans-toolbar').style.display           = isSuperAdmin ? '' : 'none';
+    // Username stays fixed for superadmin and developer: both are matched by name
+    // against .env. The password is rotatable for every account, including the
+    // developer — it used to be compiled into server.py and could not be changed.
     document.getElementById('change-username-section').style.display  = (isSuperAdmin || role === 'developer') ? 'none' : '';
-    document.getElementById('change-password-section').style.display  = role === 'developer' ? 'none' : '';
-    document.getElementById('dev-fixed-notice').style.display          = role === 'developer' ? '' : 'none';
+    document.getElementById('change-password-section').style.display  = '';
     if (admin) document.getElementById('creds-current-user').textContent = username;
     if (admin  && currentView === 'submit') switchView('inventory');
     if (!admin && (currentView === 'loans' || currentView === 'creds' || currentView === 'bulkco')) switchView('inventory');
@@ -2427,12 +2476,21 @@
   async function doCheckout() {
     if (checkoutTargetIds.length === 0) return;
 
-    const user = document.getElementById('co-user').value.trim();
-    const date = document.getElementById('co-date').value.trim();
+    const user  = document.getElementById('co-user').value.trim();
+    const date  = document.getElementById('co-date').value.trim();
+    const email = document.getElementById('co-email').value.trim();
     if (!user) { alert('Check Out User is required.'); return; }
     if (!date) { alert('Check Out Date is required.'); return; }
+    // Mirrors the server rule, so the user is told here rather than via a 422.
+    if (!email) {
+      alert('Check Out Email is required.\n\nWithout an address, loan reminders and return requests cannot reach the borrower.');
+      return;
+    }
+    if (!/^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$/.test(email)) {
+      alert(`"${email}" is not a valid email address.`);
+      return;
+    }
 
-    const email     = document.getElementById('co-email').value.trim();
     const loanUntil = document.getElementById('co-loan-until').value.trim();
     const notes     = document.getElementById('co-notes').value.trim();
 
@@ -2528,12 +2586,21 @@
         let matched = null;
         if (serial) matched = items.find(it => it.serial_number && it.serial_number.trim().toLowerCase() === serial.toLowerCase());
         if (!matched && part) matched = items.find(it => it.part_number && it.part_number.trim().toLowerCase() === part.toLowerCase());
+        // A row that names a borrower must carry a usable address: the server
+        // refuses it otherwise, and catching it here shows the admin every bad
+        // row at once instead of one failed request per item.
+        const rowEmail   = get(row, iEmail);
+        const namesUser  = isCheckOut || isChangeUser;
+        const emailOk    = /^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$/.test(rowEmail);
+
         let status, statusClass, ready;
         if (!isCheckOut && !isCheckIn && !isChangeUser) { status = 'Unknown action';       statusClass = 'row-err';  ready = false; }
         else if (!matched)                              { status = 'Item not found';        statusClass = 'row-err';  ready = false; }
         else if (isCheckIn     && !matched.checkout_user){ status = 'Not checked out';       statusClass = 'row-warn'; ready = false; }
         else if (isChangeUser  && !matched.checkout_user){ status = 'Not checked out — nothing to change'; statusClass = 'row-warn'; ready = false; }
         else if (isCheckOut    && matched.checkout_user) { status = 'Already checked out — use Change Checkout User'; statusClass = 'row-warn'; ready = false; }
+        else if (namesUser && !rowEmail)                 { status = 'Missing Check Out Email'; statusClass = 'row-err'; ready = false; }
+        else if (namesUser && !emailOk)                  { status = `Invalid email: ${rowEmail}`; statusClass = 'row-err'; ready = false; }
         else if (isChangeUser  && matched.checkout_user) { status = `Change user from ${matched.checkout_user}`; statusClass = 'row-ok'; ready = true; }
         else                                              { status = 'Ready';                 statusClass = 'row-ok';  ready = true; }
         return {
@@ -2848,7 +2915,13 @@
   async function parseWorkbook(file) {
     const fd = new FormData();
     fd.append('file', file);
-    const res = await fetch('/api/parse-file', { method: 'POST', body: fd });
+    // Admin-only endpoint — send the bearer token. FormData sets its own
+    // Content-Type boundary, so don't go through apiFetch here.
+    const res = await fetch('/api/parse-file', {
+      method: 'POST',
+      headers: authToken ? { 'Authorization': `Bearer ${authToken}` } : {},
+      body: fd,
+    });
     if (!res.ok) {
       const text = await res.text();
       let detail = `Server error (${res.status})`;

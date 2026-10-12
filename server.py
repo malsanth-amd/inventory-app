@@ -7,13 +7,16 @@ Admin-only writes: POST/PUT/DELETE require a valid session token.
 import csv
 import hashlib
 import hmac
+import html
 import io
 import json
 import os
+import re
 import secrets
 import smtplib
+import time
 import uuid
-from datetime import datetime, timezone, date as _date
+from datetime import datetime, timedelta, timezone, date as _date
 from email import encoders as email_encoders
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
@@ -30,10 +33,11 @@ except ImportError:
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator, model_validator
 
 load_dotenv()
 
@@ -53,15 +57,34 @@ def _load_admin_credentials() -> dict[str, str]:
             creds[u] = p
     if not creds:
         # Legacy single-admin fallback
-        u = os.getenv("ADMIN_USERNAME", "admin").strip()
-        p = os.getenv("ADMIN_PASSWORD", "changeme").strip()
-        creds[u] = p
+        u = os.getenv("ADMIN_USERNAME", "").strip()
+        p = os.getenv("ADMIN_PASSWORD", "").strip()
+        if u and p:
+            creds[u] = p
     return creds
 
+
+# True when nothing at all was configured and the placeholder below is in use.
+# _check_credentials refuses to migrate a placeholder into admins.json, so an
+# unconfigured deployment never gets a working "admin"/"changeme" login.
+_ADMIN_CREDS_ARE_PLACEHOLDER = False
+
 ADMIN_CREDENTIALS: dict[str, str] = _load_admin_credentials()
+if not ADMIN_CREDENTIALS:
+    # Nothing configured: keep a placeholder so first-run bootstrap still creates
+    # an account, but mark it so it can never be used as a live .env credential.
+    ADMIN_CREDENTIALS = {"admin": "changeme"}
+    _ADMIN_CREDS_ARE_PLACEHOLDER = True
+
 SUPER_ADMIN_USERNAME: str = os.getenv("SUPER_ADMIN_USERNAME", "FVDDR_Admin").strip()
-DEVELOPER_USERNAME: str = "FVDDR_Dev"
-DEVELOPER_DEFAULT_PASSWORD: str = "Developer"
+# Optional second superadmin for maintenance. Empty by default: no account is
+# created implicitly, and no password is compiled into this file. Set
+# DEVELOPER_USERNAME in .env and create the account like any other admin.
+DEVELOPER_USERNAME: str = os.getenv("DEVELOPER_USERNAME", "").strip()
+# Legacy account this file used to bootstrap with a fixed, unchangeable password.
+# Still recognised only so the server can warn that it is present; it is granted
+# no privileges here any more.
+_LEGACY_DEV_USERNAME = "FVDDR_Dev"
 
 SMTP_HOST      = os.getenv("SMTP_HOST", "").strip()
 SMTP_PORT      = int(os.getenv("SMTP_PORT", "587").strip())
@@ -153,35 +176,62 @@ def _write_admins(admins: list[dict]) -> None:
 
 def _bootstrap_admins() -> None:
     """Bootstrap admin accounts into admins.json on first run.
-    Always ensures the developer account exists."""
-    admins: list[dict] = []
-    first_run = not (ADMINS_FILE.exists() and ADMINS_FILE.stat().st_size > 2)
 
+    Only the accounts configured in .env are created. Nothing is added on later
+    starts: an account deleted by a superadmin stays deleted.
+    """
+    first_run = not (ADMINS_FILE.exists() and ADMINS_FILE.stat().st_size > 2)
     if first_run:
         admins = [{"username": u, "hash": _hash_password(p)} for u, p in ADMIN_CREDENTIALS.items()]
-        print(f"  Admin credentials bootstrapped → {ADMINS_FILE}")
-        print(f"  Plain-text passwords in .env are no longer used.")
-    else:
-        admins = _read_admins()
-
-    if not any(a["username"] == DEVELOPER_USERNAME for a in admins):
-        admins.append({"username": DEVELOPER_USERNAME, "hash": _hash_password(DEVELOPER_DEFAULT_PASSWORD)})
-        print(f"  Developer account bootstrapped: {DEVELOPER_USERNAME}")
-
-    if first_run or not any(a["username"] == DEVELOPER_USERNAME for a in _read_admins()):
         _write_admins(admins)
+        print(f"  Admin credentials bootstrapped -> {ADMINS_FILE}")
+        print(f"  Plain-text passwords in .env are no longer used.")
+        return
+
+    # Warn — loudly — if the retired hardcoded account is still in admins.json.
+    # Its password used to be fixed in source and could not be rotated, so it
+    # must be deleted or have its password changed before it means anything.
+    if any(a.get("username") == _LEGACY_DEV_USERNAME for a in _read_admins()):
+        print("=" * 60)
+        print(f"  SECURITY: the legacy '{_LEGACY_DEV_USERNAME}' account still exists.")
+        print(f"  It used to ship with a fixed password compiled into server.py.")
+        print(f"  It no longer has superadmin rights, but it can still log in.")
+        print(f"  Delete it in Settings -> Admin accounts, or change its password.")
+        print("=" * 60)
 
 
 _bootstrap_admins()
 
 
 def _check_credentials(username: str, password: str) -> bool:
-    for admin in _read_admins():
+    """Authenticate against the PBKDF2 hashes in admins.json.
+
+    An account configured in .env but missing from admins.json is accepted once
+    against the plain-text value and immediately written back as a hash. That
+    covers accounts that predate hashing or were lost when admins.json was
+    rewritten -- the superadmin named by SUPER_ADMIN_USERNAME is often one of
+    them, since renaming other accounts can leave it present only in .env.
+
+    After that single migration the plain-text value is no longer a usable
+    credential: the next login verifies against the stored hash. The built-in
+    "admin"/"changeme" placeholder never takes this path, so an unconfigured
+    deployment does not get a usable default login.
+    """
+    admins = _read_admins()
+    for admin in admins:
         if admin["username"] == username:
             return _verify_password(password, admin["hash"])
-    # Fallback to .env plain text (e.g. admins.json was deleted)
+
+    if _ADMIN_CREDS_ARE_PLACEHOLDER:
+        return False
     stored = ADMIN_CREDENTIALS.get(username)
-    return hmac.compare_digest(password, stored) if stored else False
+    if not stored or not hmac.compare_digest(password, stored):
+        return False
+
+    admins.append({"username": username, "hash": _hash_password(password)})
+    _write_admins(admins)
+    print(f"  Migrated .env account '{username}' into {ADMINS_FILE} as a PBKDF2 hash.")
+    return True
 
 
 # In-memory session store: token → username
@@ -197,6 +247,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# /api/items serialises the whole inventory on every poll — 6.2 MB at ~9.7k rows,
+# twice a minute per open tab. It is highly repetitive JSON: gzip takes it to
+# roughly 0.36 MB.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+
 bearer = HTTPBearer(auto_error=False)
 
 
@@ -204,8 +259,18 @@ bearer = HTTPBearer(auto_error=False)
 
 
 
+def _is_superadmin(username: str) -> bool:
+    """Superadmin names are matched only when configured, so an empty
+    DEVELOPER_USERNAME never matches an empty session username."""
+    if not username:
+        return False
+    return username == SUPER_ADMIN_USERNAME or (
+        bool(DEVELOPER_USERNAME) and username == DEVELOPER_USERNAME
+    )
+
+
 def _get_role(username: str) -> str:
-    if username == DEVELOPER_USERNAME:
+    if DEVELOPER_USERNAME and username == DEVELOPER_USERNAME:
         return "developer"
     if username == SUPER_ADMIN_USERNAME:
         return "superadmin"
@@ -228,7 +293,7 @@ def _require_superadmin(creds: HTTPAuthorizationCredentials | None = Depends(bea
             detail="Admin login required.",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    if _sessions[creds.credentials] not in (SUPER_ADMIN_USERNAME, DEVELOPER_USERNAME):
+    if not _is_superadmin(_sessions[creds.credentials]):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="This action requires superadmin privileges.",
@@ -426,6 +491,72 @@ def _update_item_row(item_id: str, changes: dict) -> dict | None:
     return merged
 
 
+# One UPDATE per part number covers every row that shares it. Both variants skip
+# rows that would not change, so updatedAt never churns and a repeat run is a no-op.
+_SQL_FILL_RCD_PMIC = """
+    UPDATE items
+       SET rcd         = CASE WHEN rcd  = '' THEN ? ELSE rcd  END,
+           pmic        = CASE WHEN pmic = '' THEN ? ELSE pmic END,
+           updatedAt   = ?,
+           modified_by = CASE WHEN ? != '' THEN ? ELSE modified_by END
+     WHERE trim(part_number) = ?
+       AND lower(category) LIKE '%dimm%'
+       AND ((rcd = '' AND ? != '') OR (pmic = '' AND ? != ''))
+"""
+
+_SQL_OVERWRITE_RCD_PMIC = """
+    UPDATE items
+       SET rcd         = CASE WHEN ? != '' THEN ? ELSE rcd  END,
+           pmic        = CASE WHEN ? != '' THEN ? ELSE pmic END,
+           updatedAt   = ?,
+           modified_by = CASE WHEN ? != '' THEN ? ELSE modified_by END
+     WHERE trim(part_number) = ?
+       AND lower(category) LIKE '%dimm%'
+       AND ((? != '' AND rcd != ?) OR (? != '' AND pmic != ?))
+"""
+
+
+def _fill_rcd_pmic(updates: dict[str, dict], actor: str = "", overwrite: bool = False) -> dict:
+    """Apply decoder results to every DIMM row matching each part number, in one
+    transaction.
+
+    *updates* maps a part number to {"rcd": ..., "pmic": ...}. The decoder answers
+    per part number, not per unit, so one statement per part number covers every
+    row that shares it — a few dozen statements instead of one request per row.
+
+    Default is fill-only: a column that already holds a value is left alone, so a
+    vendor an admin corrected by hand survives the background auto-fill. The manual
+    "Lookup RCD/PMIC" button passes overwrite=True, which is the refresh it has
+    always been — decoder values replace whatever is stored.
+    """
+    if not updates:
+        return {"updated": 0, "per_part_number": {}}
+
+    sql = _SQL_OVERWRITE_RCD_PMIC if overwrite else _SQL_FILL_RCD_PMIC
+    now = _now()
+    per_pn: dict[str, int] = {}
+    total = 0
+    with _DB_LOCK:
+        with _db_connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for pn, vals in updates.items():
+                rcd  = str(vals.get("rcd")  or "").strip()
+                pmic = str(vals.get("pmic") or "").strip()
+                if not rcd and not pmic:
+                    continue
+                params = (
+                    (rcd, rcd, pmic, pmic, now, actor, actor, pn, rcd, rcd, pmic, pmic)
+                    if overwrite else
+                    (rcd, pmic, now, actor, actor, pn, rcd, pmic)
+                )
+                cur = conn.execute(sql, params)
+                if cur.rowcount > 0:
+                    per_pn[pn] = cur.rowcount
+                    total += cur.rowcount
+            conn.commit()
+    return {"updated": total, "per_part_number": per_pn}
+
+
 def _delete_ids(ids: list[str]) -> int:
     """Delete exactly these ids; return how many rows actually went away."""
     if not ids:
@@ -454,6 +585,50 @@ class LoginIn(BaseModel):
     password: str
 
 
+# ── field validation ──────────────────────────────────────────────────────────
+#
+# Every write path — the add/edit form, the check-out modal, bulk check-out and
+# spreadsheet import — funnels through ItemIn, so this is the one place that can
+# hold the line for all of them. Validation used to live in the UI, and only in
+# the check-out modal: the import path enforced nothing, which is how 192 of 193
+# check-outs ended up with no email and no date, leaving the reminder system
+# with nothing to work from.
+
+# Caps are generous — they exist to stop absurd input, not to police content.
+_FIELD_MAX_CHARS: dict[str, int] = {
+    "name": 300, "notes": 4000, "serial_number": 300, "part_number": 200,
+}
+_DEFAULT_FIELD_MAX = 200
+
+# Excel dates arrive from pandas as "2026-01-05 00:00:00", or occasionally as a
+# raw serial number. Anything genuinely ambiguous (05/01/2026 — which month?) is
+# rejected rather than guessed at.
+_EXCEL_EPOCH = _date(1899, 12, 30)
+
+
+def _coerce_date(value: str, field: str) -> str:
+    """Return an ISO YYYY-MM-DD date, or "" — raising ValueError if unreadable."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+
+    head = raw.replace("T", " ").split(" ", 1)[0]
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%b-%Y", "%d %b %Y", "%b %d, %Y"):
+        try:
+            return datetime.strptime(head, fmt).date().isoformat()
+        except ValueError:
+            pass
+
+    # Excel serial day number; bounded to a sane window (roughly 1954-2064)
+    if head.isdigit() and 20000 <= int(head) <= 60000:
+        return (_EXCEL_EPOCH + timedelta(days=int(head))).isoformat()
+
+    raise ValueError(
+        f"{field} must be a date in YYYY-MM-DD form (got {raw!r}). "
+        f"Formats like 05/01/2026 are ambiguous and are not accepted."
+    )
+
+
 class ItemIn(BaseModel):
     vendor: str | None = ""
     name: str
@@ -477,9 +652,127 @@ class ItemIn(BaseModel):
     loan_until: str | None = ""   # ISO date YYYY-MM-DD
     notes: str | None = ""
 
+    @model_validator(mode="before")
+    @classmethod
+    def _tidy_strings(cls, data):
+        """Trim whitespace and turn None into "" before any field validator runs."""
+        if not isinstance(data, dict):
+            return data
+        return {
+            k: ("" if v is None else v.strip() if isinstance(v, str) else v)
+            for k, v in data.items()
+        }
+
+    @field_validator("name")
+    @classmethod
+    def _name_not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("Item Description is required.")
+        return v
+
+    @field_validator("category")
+    @classmethod
+    def _known_category(cls, v: str | None) -> str:
+        raw = str(v or "").strip()
+        if not raw:
+            return ""
+        normalized = _normalize_category(raw)
+        if normalized not in _CANONICAL_CATEGORIES:
+            raise ValueError(
+                f"Unknown category {raw!r}. Expected one of: "
+                + ", ".join(_CANONICAL_CATEGORIES)
+            )
+        return normalized
+
+    @field_validator("checkout_email")
+    @classmethod
+    def _valid_email(cls, v: str | None) -> str:
+        raw = str(v or "").strip()
+        if raw and not _EMAIL_RE.fullmatch(raw):
+            raise ValueError(f"{raw!r} is not a valid email address.")
+        return raw
+
+    @field_validator("checkout_date")
+    @classmethod
+    def _valid_checkout_date(cls, v: str | None) -> str:
+        return _coerce_date(v, "Check Out Date")
+
+    @field_validator("loan_until")
+    @classmethod
+    def _valid_loan_until(cls, v: str | None) -> str:
+        return _coerce_date(v, "Loan Until")
+
+    @model_validator(mode="after")
+    def _check_lengths_and_dates(self):
+        for field, value in self.__dict__.items():
+            if isinstance(value, str):
+                cap = _FIELD_MAX_CHARS.get(field, _DEFAULT_FIELD_MAX)
+                if len(value) > cap:
+                    raise ValueError(f"{field} is longer than {cap} characters.")
+        # A loan that ends before it starts is a typo, not a valid record.
+        if self.checkout_date and self.loan_until and self.loan_until < self.checkout_date:
+            raise ValueError(
+                f"Loan Until ({self.loan_until}) is before Check Out Date ({self.checkout_date})."
+            )
+        return self
+
 
 class BatchIn(BaseModel):
     items: list[ItemIn]
+
+
+def _borrower_is_contactable(body: ItemIn, existing: dict | None = None) -> bool:
+    """True unless this write would create or change an unreachable check-out.
+
+    A named borrower needs an email or no reminder can ever reach them — that is
+    exactly how 192 check-outs became untrackable. But rows written before this
+    rule must stay editable: if the borrower is unchanged and was already stored
+    without an address, the write is left alone. Clearing the check-out, or
+    correcting any other field on such a row, therefore still works; only naming
+    a *new* borrower without an address is refused.
+    """
+    user = (body.checkout_user or "").strip()
+    if not user or (body.checkout_email or "").strip():
+        return True
+    if existing is not None:
+        prev_user = str(existing.get("checkout_user") or "").strip()
+        prev_mail = str(existing.get("checkout_email") or "").strip()
+        if prev_user == user and not prev_mail:
+            return True   # pre-existing legacy state, unchanged by this write
+    return False
+
+
+def _uncontactable_detail(user: str) -> str:
+    return (
+        f"Check Out Email is required when an item is checked out to '{user}'. "
+        "Without an address, loan reminders and return requests cannot reach them."
+    )
+
+
+def _get_item(item_id: str) -> dict | None:
+    with _db_connect() as conn:
+        row = conn.execute(
+            f"SELECT {_COLS_SQL} FROM items WHERE id = ?", (item_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+class RcdPmicIn(BaseModel):
+    rcd:  str | None = ""
+    pmic: str | None = ""
+
+
+class BulkRcdPmicIn(BaseModel):
+    """Decoder results keyed by part number, as returned by /api/lookup-pn."""
+    updates: dict[str, RcdPmicIn]
+    # False (background auto-fill): only empty columns are filled.
+    # True  (manual Lookup button): decoder values replace what is stored.
+    overwrite: bool = False
+
+
+# The decoder answers per part number, and the whole inventory has well under a
+# hundred distinct ones; anything far beyond that is a malformed payload.
+_MAX_BULK_PNS = 1000
 
 
 # ── auth routes ───────────────────────────────────────────────────────────────
@@ -490,7 +783,7 @@ def login(body: LoginIn):
         raise HTTPException(status_code=401, detail="Invalid username or password.")
     token = secrets.token_hex(32)
     _sessions[token] = body.username
-    return {"token": token, "username": body.username, "is_superadmin": body.username in (SUPER_ADMIN_USERNAME, DEVELOPER_USERNAME), "role": _get_role(body.username)}
+    return {"token": token, "username": body.username, "is_superadmin": _is_superadmin(body.username), "role": _get_role(body.username)}
 
 
 @app.post("/api/logout", status_code=204)
@@ -503,7 +796,7 @@ def logout(creds: HTTPAuthorizationCredentials | None = Depends(bearer)):
 def me(creds: HTTPAuthorizationCredentials | None = Depends(bearer)):
     if creds and creds.credentials in _sessions:
         uname = _sessions[creds.credentials]
-        return {"authenticated": True, "username": uname, "is_superadmin": uname in (SUPER_ADMIN_USERNAME, DEVELOPER_USERNAME), "role": _get_role(uname)}
+        return {"authenticated": True, "username": uname, "is_superadmin": _is_superadmin(uname), "role": _get_role(uname)}
     return {"authenticated": False, "is_superadmin": False, "role": "guest"}
 
 
@@ -532,8 +825,6 @@ def change_password(body: ChangePasswordIn, creds: HTTPAuthorizationCredentials 
     if len(body.new_password) < 6:
         raise HTTPException(status_code=422, detail="New password must be at least 6 characters.")
     username = _sessions.get(creds.credentials, "")
-    if username == DEVELOPER_USERNAME:
-        raise HTTPException(status_code=400, detail="Developer account credentials are fixed and cannot be changed.")
     admins   = _read_admins()
     for admin in admins:
         if admin["username"] == username:
@@ -606,13 +897,15 @@ def list_items():
 def create_item(body: ItemIn, creds: HTTPAuthorizationCredentials | None = Depends(bearer)):
     _require_admin(creds)
     actor = _sessions.get(creds.credentials, "") if creds else ""
+    if not _borrower_is_contactable(body):
+        raise HTTPException(status_code=422, detail=_uncontactable_detail(body.checkout_user))
     item = {
         "id": uuid.uuid4().hex,
         "createdAt": _now(),
         "updatedAt": _now(),
         **body.model_dump(),
     }
-    if actor and actor != DEVELOPER_USERNAME:
+    if actor:
         item["modified_by"] = actor
     _insert_items([item])
     item["category"] = _normalize_category(item.get("category", ""))
@@ -623,6 +916,24 @@ def create_item(body: ItemIn, creds: HTTPAuthorizationCredentials | None = Depen
 def create_items_batch(body: BatchIn, creds: HTTPAuthorizationCredentials | None = Depends(bearer)):
     _require_admin(creds)
     actor = _sessions.get(creds.credentials, "") if creds else ""
+
+    # Report every offending row at once: an importer fixing a spreadsheet wants
+    # the whole list, not one row per attempt.
+    bad = [
+        {"row": n, "name": it.name, "error": _uncontactable_detail(it.checkout_user)}
+        for n, it in enumerate(body.items, start=1)
+        if not _borrower_is_contactable(it)
+    ]
+    if bad:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": f"{len(bad)} row(s) name a borrower with no email address.",
+                "rows": bad[:50],
+                "truncated": len(bad) > 50,
+            },
+        )
+
     created = []
     for item_in in body.items:
         item = {
@@ -631,7 +942,7 @@ def create_items_batch(body: BatchIn, creds: HTTPAuthorizationCredentials | None
             "updatedAt": _now(),
             **item_in.model_dump(),
         }
-        if actor and actor != DEVELOPER_USERNAME:
+        if actor:
             item["modified_by"] = actor
         created.append(item)
     _insert_items(created)
@@ -642,8 +953,13 @@ def create_items_batch(body: BatchIn, creds: HTTPAuthorizationCredentials | None
 def update_item(item_id: str, body: ItemIn, creds: HTTPAuthorizationCredentials | None = Depends(bearer)):
     _require_admin(creds)
     actor = _sessions.get(creds.credentials, "") if creds else ""
+    existing = _get_item(item_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Item not found")
+    if not _borrower_is_contactable(body, existing):
+        raise HTTPException(status_code=422, detail=_uncontactable_detail(body.checkout_user))
     changes = {**body.model_dump(), "updatedAt": _now()}
-    if actor and actor != DEVELOPER_USERNAME:
+    if actor:
         changes["modified_by"] = actor
     updated = _update_item_row(item_id, changes)
     if updated is None:
@@ -655,6 +971,29 @@ def update_item(item_id: str, body: ItemIn, creds: HTTPAuthorizationCredentials 
 def delete_item(item_id: str):
     if _delete_ids([item_id]) == 0:
         raise HTTPException(status_code=404, detail="Item not found")
+
+
+@app.post("/api/items/bulk-rcd-pmic")
+def bulk_rcd_pmic(body: BulkRcdPmicIn, creds: HTTPAuthorizationCredentials | None = Depends(bearer)):
+    """Fill RCD/PMIC across every DIMM sharing each part number, in one transaction.
+
+    Replaces the client-side loop that issued one PUT per row: that took minutes
+    over thousands of items and left the table half-filled whenever the tab was
+    closed before it finished.
+    """
+    _require_admin(creds)
+    actor = _sessions.get(creds.credentials, "") if creds else ""
+    if len(body.updates) > _MAX_BULK_PNS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Too many part numbers in one request (max {_MAX_BULK_PNS}).",
+        )
+    updates = {
+        pn.strip(): vals.model_dump()
+        for pn, vals in body.updates.items()
+        if pn.strip()
+    }
+    return _fill_rcd_pmic(updates, actor, body.overwrite)
 
 
 class BatchDeleteIn(BaseModel):
@@ -678,6 +1017,22 @@ class ReturnRequestIn(BaseModel):
     ids:     list[str]
     cc:      list[str] | None = None   # extra CC addresses chosen by admin
     message: str | None = None
+
+
+def _esc(val: object) -> str:
+    """Escape a value for interpolation into an HTML email body.
+
+    Everything these templates interpolate is attacker-reachable: item names and
+    serial numbers come from uploaded spreadsheets, and the submission form is
+    open to anyone on the network. Unescaped, a crafted value becomes arbitrary
+    markup — including links — inside an email the admin trusts.
+    """
+    return html.escape(str(val if val is not None else ""), quote=True)
+
+
+def _header_safe(val: str) -> str:
+    """Strip CR/LF so a value cannot inject extra SMTP headers, and bound length."""
+    return re.sub(r"[\r\n]+", " ", str(val or "")).strip()[:200]
 
 
 def _smtp_send(to_addr: str, msg: MIMEMultipart, extra_cc: list[str] | None = None) -> None:
@@ -737,11 +1092,11 @@ def _build_reminder_msg(to_addr: str, checkout_user: str, items_list: list[dict]
     for item in items_list:
         due_cell  = item.get("loan_until") or item.get("checkout_date") or "—"
         due_label = "Due" if item.get("loan_until") else "Since"
-        sn_cell   = f"<br><span style='color:#777;font-size:0.9em'>S/N: {item['serial_number']}</span>" if item.get("serial_number") else ""
+        sn_cell   = f"<br><span style='color:#777;font-size:0.9em'>S/N: {_esc(item['serial_number'])}</span>" if item.get("serial_number") else ""
         rows_html += (
             f"<tr style='border-top:1px solid #e0e0e0'>"
-            f"<td style='padding:6px 16px 6px 0;font-weight:bold'>{item.get('name','—')}{sn_cell}</td>"
-            f"<td style='padding:6px 0;color:#555'>{due_label}: {due_cell}</td>"
+            f"<td style='padding:6px 16px 6px 0;font-weight:bold'>{_esc(item.get('name','—'))}{sn_cell}</td>"
+            f"<td style='padding:6px 0;color:#555'>{due_label}: {_esc(due_cell)}</td>"
             f"</tr>"
         )
 
@@ -751,11 +1106,11 @@ def _build_reminder_msg(to_addr: str, checkout_user: str, items_list: list[dict]
         else f"you have <strong>{count} items</strong> checked out from the lab inventory:"
     )
     body_html = (
-        f"<p>Hi {checkout_user},</p>"
+        f"<p>Hi {_esc(checkout_user)},</p>"
         f"<p>This is a reminder that {intro}</p>"
         f"<table style='border-collapse:collapse;margin:8px 0'>{rows_html}</table>"
         f"<p>Please <strong>return</strong> each item as soon as it is no longer needed or <strong>reply</strong> to this email if require to extend loan period.</p>"
-        + (f"<p>{extra_message}</p>" if extra_message else "")
+        + (f"<p>{_esc(extra_message)}</p>" if extra_message else "")
         + "<p>Thank you,<br>FVDDR Inventory Admin</p>"
     )
 
@@ -816,16 +1171,16 @@ def _build_checkout_msg(to_addr: str, checkout_user: str, items_list: list[dict]
     for item in items_list:
         due = item.get("loan_until") or item.get("checkout_date") or "—"
         due_label = "Due" if item.get("loan_until") else "Checked out"
-        sn = f"<br><span style='color:#777;font-size:0.9em'>S/N: {item['serial_number']}</span>" if item.get("serial_number") else ""
-        pn = f"<br><span style='color:#777;font-size:0.9em'>PN: {item['part_number']}</span>"   if item.get("part_number")  else ""
+        sn = f"<br><span style='color:#777;font-size:0.9em'>S/N: {_esc(item['serial_number'])}</span>" if item.get("serial_number") else ""
+        pn = f"<br><span style='color:#777;font-size:0.9em'>PN: {_esc(item['part_number'])}</span>"   if item.get("part_number")  else ""
         rows_html += (
             f"<tr style='border-top:1px solid #e0e0e0'>"
-            f"<td style='padding:6px 16px 6px 0;font-weight:bold'>{item.get('name','—')}{sn}{pn}</td>"
-            f"<td style='padding:6px 0;color:#555'>{due_label}: {due}</td>"
+            f"<td style='padding:6px 16px 6px 0;font-weight:bold'>{_esc(item.get('name','—'))}{sn}{pn}</td>"
+            f"<td style='padding:6px 0;color:#555'>{due_label}: {_esc(due)}</td>"
             f"</tr>"
         )
     body_html = (
-        f"<p>Hi {checkout_user},</p>"
+        f"<p>Hi {_esc(checkout_user)},</p>"
         f"<p>{'The following item has' if count == 1 else f'The following {count} items have'} been checked out to you from the lab inventory:</p>"
         f"<table style='border-collapse:collapse;margin:8px 0'>{rows_html}</table>"
         f"<p>Please return the item(s) by the due date, or <strong>reply</strong> to this email to request an extension.</p>"
@@ -969,15 +1324,15 @@ def _build_return_request_msg(
     for item in items_list:
         due_cell  = item.get("loan_until") or item.get("checkout_date") or "—"
         due_label = "Due" if item.get("loan_until") else "Since"
-        sn  = f"<br><span style='color:#777;font-size:0.85em'>S/N: {item['serial_number']}</span>" if item.get("serial_number") else ""
-        pn  = f"<br><span style='color:#777;font-size:0.85em'>PN: {item['part_number']}</span>"   if item.get("part_number")  else ""
-        loc = f"<br><span style='color:#777;font-size:0.85em'>Location: {item['location']}</span>" if item.get("location") else ""
-        cat = f"<span style='color:#777;font-size:0.85em'>{item['category']}</span>" if item.get("category") else ""
+        sn  = f"<br><span style='color:#777;font-size:0.85em'>S/N: {_esc(item['serial_number'])}</span>" if item.get("serial_number") else ""
+        pn  = f"<br><span style='color:#777;font-size:0.85em'>PN: {_esc(item['part_number'])}</span>"   if item.get("part_number")  else ""
+        loc = f"<br><span style='color:#777;font-size:0.85em'>Location: {_esc(item['location'])}</span>" if item.get("location") else ""
+        cat = f"<span style='color:#777;font-size:0.85em'>{_esc(item['category'])}</span>" if item.get("category") else ""
         rows_html += (
             f"<tr style='border-top:1px solid #e0e0e0'>"
-            f"<td style='padding:6px 16px 6px 0;font-weight:bold'>{item.get('name','—')}{sn}{pn}{loc}</td>"
+            f"<td style='padding:6px 16px 6px 0;font-weight:bold'>{_esc(item.get('name','—'))}{sn}{pn}{loc}</td>"
             f"<td style='padding:6px 8px 6px 0;color:#555'>{cat}</td>"
-            f"<td style='padding:6px 0;color:#555;white-space:nowrap'>{due_label}: {due_cell}</td>"
+            f"<td style='padding:6px 0;color:#555;white-space:nowrap'>{due_label}: {_esc(due_cell)}</td>"
             f"</tr>"
         )
 
@@ -986,9 +1341,9 @@ def _build_return_request_msg(
         if count == 1
         else f"the FVDDR Lab Admin is requesting that you return the following <strong>{count} items</strong>:"
     )
-    msg_block = f"<p style='background:#fffbe6;border-left:3px solid #f59e0b;padding:10px 14px;border-radius:4px;margin:12px 0'><strong>Note from Admin:</strong><br>{message}</p>" if message else ""
+    msg_block = f"<p style='background:#fffbe6;border-left:3px solid #f59e0b;padding:10px 14px;border-radius:4px;margin:12px 0'><strong>Note from Admin:</strong><br>{_esc(message)}</p>" if message else ""
     body_html = (
-        f"<p>Hi {checkout_user},</p>"
+        f"<p>Hi {_esc(checkout_user)},</p>"
         f"<p>This is to let you know that {intro}</p>"
         f"<table style='border-collapse:collapse;margin:8px 0'>{rows_html}</table>"
         + msg_block
@@ -1069,6 +1424,55 @@ def request_return(body: ReturnRequestIn):
 
 # ── user submission ───────────────────────────────────────────────────────────
 
+_MAX_UPLOAD_BYTES = 25 * 1024 * 1024   # 25 MB — far above any real inventory sheet
+_MAX_NOTES_CHARS  = 2000
+_EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[A-Za-z]{2,}")
+
+
+async def _read_upload(file: UploadFile, limit: int = _MAX_UPLOAD_BYTES) -> bytes:
+    """Read an upload in chunks, refusing anything over *limit*.
+
+    A bare file.read() pulls the entire body into memory before anything checks
+    it, which makes an oversized upload a cheap way to exhaust the server.
+    """
+    chunks: list[bytes] = []
+    total  = 0
+    while chunk := await file.read(1024 * 1024):
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File is too large (limit {limit // (1024 * 1024)} MB).",
+            )
+        chunks.append(chunk)
+    if not total:
+        raise HTTPException(status_code=422, detail="The uploaded file is empty.")
+    return b"".join(chunks)
+
+
+_SUBMISSION_WINDOW_SEC      = 3600
+_MAX_SUBMISSIONS_PER_WINDOW = 20
+_submission_times: list[float] = []
+_submission_lock = _threading.Lock()
+
+
+def _rate_limit_submission() -> None:
+    """Cap how many submission emails the server will relay per hour.
+
+    This endpoint takes no login and makes the server send mail with an
+    attachment, so it needs a ceiling no matter who is calling it.
+    """
+    now = time.monotonic()
+    with _submission_lock:
+        _submission_times[:] = [t for t in _submission_times if now - t < _SUBMISSION_WINDOW_SEC]
+        if len(_submission_times) >= _MAX_SUBMISSIONS_PER_WINDOW:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many submissions in the last hour. Please try again later.",
+            )
+        _submission_times.append(now)
+
+
 @app.post("/api/submit-request")
 async def submit_request(
     submitter_name:  str        = Form(...),
@@ -1082,12 +1486,25 @@ async def submit_request(
     if not ADMIN_EMAIL:
         raise HTTPException(status_code=422, detail="No admin email address configured. Contact your admin.")
 
-    fname = (file.filename or "attachment").strip()
+    # Keep only the basename: a filename is attacker-controlled and ends up in a
+    # Content-Disposition header and in the admin's mail client.
+    fname = Path((file.filename or "attachment").strip()).name
+    fname = _header_safe(fname).replace('"', "") or "attachment"
     ext   = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
     if ext not in ("csv", "xlsx", "xls"):
         raise HTTPException(status_code=422, detail="Only .csv, .xlsx, or .xls files are accepted.")
 
-    content = await file.read()
+    submitter_name  = _header_safe(submitter_name)
+    submitter_email = _header_safe(submitter_email)
+    if not submitter_name:
+        raise HTTPException(status_code=422, detail="Please provide your name.")
+    if not _EMAIL_RE.fullmatch(submitter_email):
+        raise HTTPException(status_code=422, detail="Please provide a valid email address.")
+    if len(notes) > _MAX_NOTES_CHARS:
+        raise HTTPException(status_code=422, detail=f"Notes are limited to {_MAX_NOTES_CHARS} characters.")
+
+    content = await _read_upload(file)
+    _rate_limit_submission()
     submitted_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     body_text = (
@@ -1099,24 +1516,28 @@ async def submit_request(
         + (f"\nNotes:\n{notes}\n" if notes.strip() else "")
         + "\nThe file is attached. Please review and import it into the inventory system.\n"
     )
+    # Every value below is supplied by an unauthenticated caller, so all of it is
+    # escaped: otherwise a crafted name or note becomes live markup in the mail
+    # the admin opens and trusts.
     body_html = (
         f"<p>A user has submitted an inventory addition request.</p>"
         f"<table style='border-collapse:collapse;margin:8px 0'>"
-        f"<tr><td style='padding:3px 14px 3px 0;font-weight:bold'>Name</td><td>{submitter_name}</td></tr>"
-        f"<tr><td style='padding:3px 14px 3px 0;font-weight:bold'>Email</td><td>{submitter_email}</td></tr>"
-        f"<tr><td style='padding:3px 14px 3px 0;font-weight:bold'>File</td><td>{fname}</td></tr>"
-        f"<tr><td style='padding:3px 14px 3px 0;font-weight:bold'>Sent</td><td>{submitted_at}</td></tr>"
-        + (f"<tr><td style='padding:3px 14px 3px 0;font-weight:bold;vertical-align:top'>Notes</td><td>{notes}</td></tr>" if notes.strip() else "")
+        f"<tr><td style='padding:3px 14px 3px 0;font-weight:bold'>Name</td><td>{_esc(submitter_name)}</td></tr>"
+        f"<tr><td style='padding:3px 14px 3px 0;font-weight:bold'>Email</td><td>{_esc(submitter_email)}</td></tr>"
+        f"<tr><td style='padding:3px 14px 3px 0;font-weight:bold'>File</td><td>{_esc(fname)}</td></tr>"
+        f"<tr><td style='padding:3px 14px 3px 0;font-weight:bold'>Sent</td><td>{_esc(submitted_at)}</td></tr>"
+        + (f"<tr><td style='padding:3px 14px 3px 0;font-weight:bold;vertical-align:top'>Notes</td><td>{_esc(notes)}</td></tr>" if notes.strip() else "")
         + f"</table>"
         f"<p>The file is attached. Please review and import it into the inventory system.</p>"
     )
 
     msg = MIMEMultipart("mixed")
+    # submitter_name / submitter_email are already CR/LF-stripped by _header_safe
+    # and the address is regex-validated, so neither can inject extra headers.
     msg["Subject"] = f"[Lab Inventory] Submission from {submitter_name}"
     msg["From"]    = f"{SMTP_FROM_NAME} <{SMTP_FROM}>" if SMTP_FROM_NAME else SMTP_FROM
     msg["To"]      = ADMIN_EMAIL
-    if submitter_email:
-        msg["Reply-To"] = submitter_email
+    msg["Reply-To"] = submitter_email
 
     alt = MIMEMultipart("alternative")
     alt.attach(MIMEText(body_text, "plain"))
@@ -1178,9 +1599,13 @@ COLUMNS = [
 ]
 
 
-@app.post("/api/parse-file")
+@app.post("/api/parse-file", dependencies=[Depends(_require_admin)])
 async def parse_file(file: UploadFile = File(...)):
     """Parse an uploaded CSV or xlsx file, decrypting if needed.
+
+    Admin-only: the import flow that calls this is already behind the admin UI,
+    and the parsers it reaches (pandas, openpyxl, msoffcrypto) are a large
+    attack surface to expose to anyone who can reach the port.
 
     Returns: {"sheets": [{"name": str, "rows": [[str, ...]]}]}
     Each row is a list of cell strings; row 0 is always the header row.
@@ -1194,7 +1619,7 @@ async def parse_file(file: UploadFile = File(...)):
 
 
 async def _do_parse_file(file: UploadFile):
-    content = await file.read()
+    content = await _read_upload(file)
     fname   = (file.filename or "").lower()
 
     # ── CSV ──────────────────────────────────────────────────────────────────
@@ -1392,7 +1817,9 @@ def download_bulk_template():
         ("Location",                       "location",       18, False, False),
         ("Tray / Comment",                 "tray",           18, False, False),
         ("Check Out User",                 "checkout_user",  20, False, False),
-        ("Check Out Email",                "checkout_email", 26, False, False),
+        # Required whenever the row names a borrower (check_out / change_user);
+        # left blank on check_in rows.
+        ("Check Out Email *",              "checkout_email", 26, True,  False),
         ("Check Out Date (YYYY-MM-DD)",    "checkout_date",  20, False, True),
         ("Loan Until (YYYY-MM-DD)",        "loan_until",     18, False, True),
         ("Notes",                          "notes",          30, False, False),
