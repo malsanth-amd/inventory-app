@@ -1619,7 +1619,10 @@
     };
     const serial = seg('S');
     if (!serial) return null;
-    return { raw, serial, partNumber: seg('P'), label: seg('L') };
+    // The (L) description segment is deliberately not returned — nothing reads
+    // it. L stays in the lookahead above so a following (L) still terminates a
+    // segment, whatever order the scanner emits them in.
+    return { raw, serial, partNumber: seg('P') };
   }
 
   // The serial an item is really identified by, whether it is stored bare or
