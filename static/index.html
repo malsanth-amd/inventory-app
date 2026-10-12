@@ -527,6 +527,13 @@
       padding: 6px 10px 6px 0; border-bottom: 1px solid var(--border2);
     }
     .report-table tbody tr:last-child td { border-bottom: none; }
+
+    .decoder-bar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
+    .decoder-bar input {
+      flex: 1; max-width: 420px; font-family: var(--mono, ui-monospace, monospace);
+    }
+    .decoder-table td:first-child { width: 190px; }
+    .decoder-table td:nth-child(2) { font-family: var(--mono, ui-monospace, monospace); }
     .loans-group { margin-bottom: 20px; border-radius: var(--radius); border: 1px solid var(--border); overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
     .loans-group-header {
       font-size: 0.82rem; font-weight: 700; padding: 10px 16px;
@@ -800,6 +807,7 @@
     <button class="view-tab" id="tab-loans" onclick="switchView('loans')" style="display:none">&#128197; Loans <span class="tab-badge" id="loans-badge" style="display:none">0</span></button>
     <button class="view-tab" id="tab-bulkco" onclick="switchView('bulkco')" style="display:none">&#128260; Bulk Check In/Out</button>
     <button class="view-tab" id="tab-reports" onclick="switchView('reports')" style="display:none">&#128202; Reports</button>
+    <button class="view-tab" id="tab-decoder" onclick="switchView('decoder')" style="display:none">&#128269; DIMM Decoder</button>
     <button class="view-tab" id="tab-submit" onclick="switchView('submit')">&#128196; Submit Request</button>
     <button class="view-tab" id="tab-creds" onclick="switchView('creds')" style="display:none">&#128274; Credentials</button>
   </div>
@@ -816,6 +824,20 @@
   </div>
 
   <!-- Bulk Check In / Check Out view -->
+  <div class="loans-view" id="decoder-view">
+    <div class="decoder-bar">
+      <input type="text" id="decoder-pn" autocomplete="off" spellcheck="false"
+             placeholder="Part number, or scan a label…"
+             onkeydown="if(event.key==='Enter'){event.preventDefault();runDecoder();}" />
+      <button class="btn-primary" onclick="runDecoder()">Decode</button>
+      <button class="btn-ghost" onclick="clearDecoder()">Clear</button>
+    </div>
+    <p class="report-note" style="margin-top:-6px">
+      Queries ddrmpn.amd.com directly. A full 2D barcode works too &mdash; the part number is taken from it.
+    </p>
+    <div id="decoder-result"></div>
+  </div>
+
   <div class="loans-view" id="reports-view">
     <div id="reports-body"><div class="loading-row">Loading…</div></div>
   </div>
@@ -2314,6 +2336,7 @@
     document.getElementById('tab-loans').style.display            = admin ? '' : 'none';
     document.getElementById('tab-bulkco').style.display           = admin ? '' : 'none';
     document.getElementById('tab-reports').style.display          = admin ? '' : 'none';
+    document.getElementById('tab-decoder').style.display          = admin ? '' : 'none';
     document.getElementById('tab-creds').style.display            = admin ? '' : 'none';
     document.getElementById('tab-submit').style.display           = admin ? 'none' : '';
     document.getElementById('field-location').style.display            = admin ? '' : 'none';
@@ -3914,22 +3937,150 @@
            Generated ${esc(new Date(d.generated_at).toLocaleString())}</p>`;
   }
 
+  // ── DIMM decoder ────────────────────────────────────────────────────────────
+  //
+  // Everything here already came back from /api/lookup-pn; the rest of the app
+  // reads two of its sixteen fields and discards the others. Displaying the lot
+  // saves a trip to ddrmpn.amd.com, and comparing it against what we store
+  // turns the lookup into a spot-check — which matters, because stored speed
+  // disagrees with the decoder on every DIMM in the table.
+
+  // Decoder field -> the inventory column it should agree with, and how to
+  // compare them. 'number' compares magnitude so "12800" matches "12800 MT/s";
+  // 'exact' does not, because 2Rx8 and 2Rx4 share a magnitude of 2.
+  const _DECODER_TO_FIELD = {
+    'DIMM Speed':   { field: 'speed',    mode: 'number' },
+    'DIMM Density': { field: 'capacity', mode: 'number' },
+    'DRAM Density': { field: 'density',  mode: 'number' },
+    'DIMM Config':  { field: 'rank',     mode: 'exact'  },
+    'RCD Vendor':   { field: 'rcd',      mode: 'exact'  },
+    'PMIC Vendor':  { field: 'pmic',     mode: 'exact'  },
+  };
+  const _FIELD_LABELS_INV = {
+    speed: 'Speed', rank: 'Rank', capacity: 'Capacity',
+    density: 'Density', rcd: 'RCD', pmic: 'PMIC',
+  };
+  // Shown first, in this order; anything else the decoder returns follows.
+  const _DECODER_ORDER = [
+    'Part Number', 'Manufacturer', 'DIMM Info', 'Memory Technology',
+    'DIMM Type', 'DIMM Speed', 'DIMM Config', 'DIMM Rank', 'DRAM Width',
+    'DIMM Density', 'DRAM Density', 'Dimm Width', 'CAS Latency',
+    'DRAM Die Rev', 'RCD Vendor', 'PMIC Vendor', 'DB Map',
+    'Pin', 'Sales Type', 'JEDEC PCB rev', 'Extra info',
+  ];
+
+  // True when the decoder and the stored column agree, or when there is nothing
+  // stored to disagree with.
+  function decoderAgrees(decoded, stored, mode) {
+    const norm = v => String(v ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const x = norm(decoded), y = norm(stored);
+    if (!x || !y) return true;
+    if (x === y) return true;
+    if (mode === 'number') {
+      const a = magnitude(decoded), b = magnitude(stored);
+      return a !== null && b !== null && a === b;
+    }
+    return false;
+  }
+
+  // The decoder's value for a field, and whether it contradicts what we store.
+  function _decoderMismatch(raw, key, sample) {
+    const map = _DECODER_TO_FIELD[key];
+    if (!map || !sample) return null;
+    const value = String(raw[key] ?? '');
+    if (/^(WARNING!|ERROR!)/i.test(value)) return null;
+    const stored = String(sample[map.field] ?? '').trim();
+    if (!stored) return null;
+    return decoderAgrees(value, stored, map.mode)
+      ? { field: map.field, stored, differs: false }
+      : { field: map.field, stored, differs: true };
+  }
+
+  function clearDecoder() {
+    document.getElementById('decoder-result').innerHTML = '';
+    const input = document.getElementById('decoder-pn');
+    input.value = '';
+    input.focus();
+  }
+
+  async function runDecoder() {
+    const input = document.getElementById('decoder-pn');
+    const out   = document.getElementById('decoder-result');
+    const typed = input.value.trim();
+    if (!typed) { out.innerHTML = ''; return; }
+
+    // A scanned label carries the part number in its (P) segment.
+    const pn = parseBarcode(typed)?.partNumber || typed;
+    out.innerHTML = `<div class="loading-row">Decoding ${esc(pn)}…</div>`;
+
+    let data;
+    try {
+      data = await apiFetch(`/api/lookup-pn/${encodeURIComponent(pn)}`);
+    } catch (e) {
+      out.innerHTML = _reportCard('Not decoded',
+        `<p style="color:var(--danger);margin:0">${esc(e.message)}</p>`,
+        `ddrmpn.amd.com was asked for "${pn}".`);
+      return;
+    }
+
+    const raw  = data.raw || {};
+    const keys = [..._DECODER_ORDER.filter(k => k in raw),
+                  ...Object.keys(raw).filter(k => !_DECODER_ORDER.includes(k))];
+
+    // What we hold for this part number, for the comparison below.
+    const mine = items.filter(i => (i.part_number || '').trim().toLowerCase() === pn.toLowerCase());
+    const sample = mine[0];
+
+    const rows = keys.map(k => {
+      const value = String(raw[k] ?? '');
+      const warn  = /^(WARNING!|ERROR!)/i.test(value);
+      const cmp   = _decoderMismatch(raw, k, sample);
+      return `<tr>
+        <td style="white-space:nowrap;color:var(--muted)">${esc(k)}</td>
+        <td><strong${warn ? ' style="color:var(--danger);font-weight:500"' : ''}>${esc(value) || '—'}</strong></td>
+        <td style="text-align:right">${
+          cmp && cmp.differs
+            ? `<span class="status-badge status-suspect" title="The ${esc(_FIELD_LABELS_INV[cmp.field] || cmp.field)} column on your ${mine.length} matching item(s)">inventory says ${esc(cmp.stored)}</span>`
+            : cmp ? '<span style="color:var(--muted);font-size:0.8rem">matches inventory</span>' : ''
+        }</td>
+      </tr>`;
+    }).join('');
+
+    const mismatches = keys.filter(k => _decoderMismatch(raw, k, sample)?.differs);
+
+    const held = mine.length
+      ? `You hold <strong>${mine.length}</strong> item(s) with this part number.`
+         + (mismatches.length
+             ? ` <span style="color:var(--danger)">${mismatches.length} field(s) disagree with what is stored.</span>`
+             : ' Everything comparable matches.')
+      : 'No items in this inventory carry this part number.';
+
+    out.innerHTML =
+      _reportCard(raw['Part Number'] || pn,
+        `<table class="report-table decoder-table"><tbody>${rows}</tbody></table>`,
+        raw['DIMM Info'] || '')
+      + _reportCard('Against your inventory', `<p style="margin:0">${held}</p>`);
+  }
+
   function switchView(view) {
     currentView = view;
     document.getElementById('inventory-view').style.display = view === 'inventory' ? '' : 'none';
     document.getElementById('loans-view').classList.toggle('active', view === 'loans');
     document.getElementById('bulkco-view').classList.toggle('active', view === 'bulkco');
     document.getElementById('reports-view').classList.toggle('active', view === 'reports');
+    document.getElementById('decoder-view').classList.toggle('active', view === 'decoder');
     document.getElementById('submit-view').classList.toggle('active', view === 'submit');
     document.getElementById('creds-view').classList.toggle('active', view === 'creds');
     document.getElementById('tab-inventory').classList.toggle('active', view === 'inventory');
     document.getElementById('tab-loans').classList.toggle('active', view === 'loans');
     document.getElementById('tab-bulkco').classList.toggle('active', view === 'bulkco');
     document.getElementById('tab-reports').classList.toggle('active', view === 'reports');
+    document.getElementById('tab-decoder').classList.toggle('active', view === 'decoder');
     document.getElementById('tab-submit').classList.toggle('active', view === 'submit');
     document.getElementById('tab-creds').classList.toggle('active', view === 'creds');
     if (view === 'loans') renderLoansView();
     if (view === 'reports') renderReportsView();
+    if (view === 'decoder') setTimeout(() => document.getElementById('decoder-pn')?.focus(), 0);
     if (view === 'creds' && isSuperAdmin) loadAdminUsers();
   }
 

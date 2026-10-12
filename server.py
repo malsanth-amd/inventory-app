@@ -2277,9 +2277,17 @@ def export_inventory(
 
 # ── serve frontend ────────────────────────────────────────────────────────────
 
-@app.get("/api/lookup-pn/{part_number}")
+@app.get("/api/lookup-pn/{part_number}", dependencies=[Depends(_require_admin)])
 async def lookup_part_number(part_number: str):
-    """Proxy to ddrmpn.amd.com — returns rcd and pmic vendor for a given part number."""
+    """Proxy to ddrmpn.amd.com — full decode for a part number.
+
+    Returns the cleaned rcd/pmic vendors plus `raw`, the decoder's whole
+    response, which the Decoder tab renders.
+
+    Admin-only: every caller is already behind the admin UI, and leaving it open
+    made this an unauthenticated proxy onto an internal service for anyone who
+    could reach the port.
+    """
     import httpx
     pn = part_number.strip()
     if not pn:
