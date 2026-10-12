@@ -306,6 +306,8 @@
     }
     .status-available  { background: #dafbe1; color: #116329; }
     .status-checkedout { background: #fff8c5; color: #7d4e00; }
+    .status-bad        { background: #ffebe9; color: #a40e26; border: 1px solid #ff818266; }
+    .status-suspect    { background: #fff1e5; color: #8a4b00; border: 1px solid #f59e0b55; }
 
     .actions { display: flex; gap: 8px; }
 
@@ -665,6 +667,12 @@
       background: var(--danger); color: #fff;
       display: none; align-items: center; gap: 6px;
     }
+    .btn-mark-bad, .btn-mark-suspect, .btn-mark-good {
+      display: none; align-items: center; gap: 6px; color: #fff;
+    }
+    .btn-mark-bad     { background: #a40e26; }
+    .btn-mark-suspect { background: #b45309; }
+    .btn-mark-good    { background: #1a7f37; }
     .btn-delete-sel.visible { display: inline-flex; }
     .btn-delete-sel:hover:not(:disabled) { background: var(--danger-hover); }
 
@@ -724,6 +732,8 @@
     body.dark .due-future  { background: var(--surface2); color: var(--text-dim); }
     body.dark .status-available  { background: rgba(63,185,80,0.12); color: #3fb950; }
     body.dark .status-checkedout { background: rgba(210,153,34,0.12); color: #d29922; }
+    body.dark .status-bad        { background: rgba(248,81,73,0.14);  color: #ff7b72; border-color: #f8514955; }
+    body.dark .status-suspect    { background: rgba(210,153,34,0.14); color: #e3b341; border-color: #d2992255; }
     body.dark .error-banner { background: rgba(248,81,73,0.1); border-color: rgba(248,81,73,0.35); color: #ff7b72; }
     body.dark .toast { background: var(--surface2); color: var(--text); }
     body.dark .chip-ok   { background: rgba(63,185,80,0.12); color: #3fb950; }
@@ -1016,6 +1026,9 @@
     <button class="btn-checkout-sel" id="checkout-sel-btn" onclick="openCheckoutBatch()">&#128722; Check Out Selected (<span id="checkout-sel-count">0</span>)</button>
     <button class="btn-checkin-sel" id="checkin-sel-btn" onclick="checkInSelected()">&#8626; Check In Selected (<span id="checkin-sel-count">0</span>)</button>
     <button class="btn-return-req" id="return-req-btn" onclick="openReturnRequestModal()">&#9993; Request Return (<span id="return-req-count">0</span>)</button>
+    <button class="btn-mark-bad" id="mark-bad-btn" onclick="markSelectedCondition('Bad')" title="Record these as faulty, with a reason">&#9888; Mark Bad (<span id="mark-bad-count">0</span>)</button>
+    <button class="btn-mark-suspect" id="mark-suspect-btn" onclick="markSelectedCondition('Suspect')" title="Failed once, needs retesting">&#10068; Mark Suspect (<span id="mark-suspect-count">0</span>)</button>
+    <button class="btn-mark-good" id="mark-good-btn" onclick="markSelectedCondition('Good')" title="Clear the fault flag">&#10003; Mark Good (<span id="mark-good-count">0</span>)</button>
     <button class="btn-delete-sel" id="delete-sel-btn" onclick="deleteSelected()">&#128465; Delete Selected (<span id="delete-sel-count">0</span>)</button>
     <span id="select-all-banner" style="display:none;font-size:0.85rem;color:var(--text-dim)">
       <span id="select-all-msg"></span>
@@ -1193,6 +1206,20 @@
       <div class="form-row">
         <label>Loan Until <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted)">(optional)</span></label>
         <input type="date" id="f-loan-until" />
+      </div>
+    </div>
+    <div class="form-grid">
+      <div class="form-row">
+        <label>Condition</label>
+        <select id="f-condition" onchange="onConditionChange()">
+          <option value="Good">Good</option>
+          <option value="Suspect">Suspect — failed once, needs retesting</option>
+          <option value="Bad">Bad — confirmed faulty</option>
+        </select>
+      </div>
+      <div class="form-row" id="f-condition-note-row" style="display:none">
+        <label>What is wrong <span style="color:var(--danger)">*</span></label>
+        <input type="text" id="f-condition-note" placeholder="e.g. failed MemTest at 4800, bank 3" />
       </div>
     </div>
     <div class="form-row">
@@ -1454,6 +1481,7 @@
     { key: 'tray',          label: 'Tray / Comment',   defaultOn: false, adminOnly: true,  sortable: true  },
     { key: 'team',          label: 'Team',             defaultOn: false, adminOnly: false, sortable: true  },
     { key: 'owner',         label: 'Owner',            defaultOn: false, adminOnly: false, sortable: true  },
+    { key: 'condition',     label: 'Condition',        defaultOn: false, adminOnly: false, sortable: true  },
     { key: 'checkout_user', label: 'Check Out User',   defaultOn: true,  adminOnly: false, sortable: true  },
     { key: 'checkout_date', label: 'Check Out Date',   defaultOn: false, adminOnly: false, sortable: true  },
     { key: 'loan_until',    label: 'Loan Until',       defaultOn: true,  adminOnly: false, sortable: true  },
@@ -1707,6 +1735,72 @@
   }
 
   function resetScanCount() { _scannedCount = 0; }
+
+  // ── condition ───────────────────────────────────────────────────────────────
+  //
+  // Good / Suspect / Bad, independent of check-out state. A blank value means
+  // Good, so the rows that predate the column need no backfill.
+
+  // The reason field only matters for a fault, so it appears only then — and the
+  // server rejects a Bad/Suspect item that has no reason, so it is not optional.
+  function onConditionChange() {
+    const value = document.getElementById('f-condition')?.value || 'Good';
+    const row   = document.getElementById('f-condition-note-row');
+    if (row) row.style.display = value === 'Good' ? 'none' : '';
+  }
+
+  function itemCondition(item) {
+    const c = String(item?.condition || '').trim();
+    return c || 'Good';
+  }
+
+  function isFaulty(item) { return itemCondition(item) === 'Bad'; }
+
+  function conditionBadge(item) {
+    const c = itemCondition(item);
+    if (c === 'Good') return '';
+    const cls  = c === 'Bad' ? 'status-bad' : 'status-suspect';
+    const why  = String(item.condition_note || '').trim();
+    const when = item.updatedAt ? new Date(item.updatedAt).toLocaleDateString() : '';
+    const tip  = [why, item.modified_by ? `marked by ${item.modified_by}` : '', when]
+                   .filter(Boolean).join(' · ');
+    return `<span class="status-badge ${cls}" title="${esc(tip || c)}">${esc(c.toUpperCase())}</span>`;
+  }
+
+  // Admin action from the selection bar: scan or tick the faulty items, then
+  // record what is wrong with them in one go.
+  async function markSelectedCondition(condition) {
+    const ids = allFilteredSelected ? filtered.map(i => i.id) : [...selectedIds];
+    if (!ids.length || !isAdmin) return;
+
+    let note = '';
+    if (condition !== 'Good') {
+      note = (prompt(
+        `Marking ${ids.length} item(s) as ${condition}.\n\n` +
+        `What is wrong with ${ids.length === 1 ? 'it' : 'them'}? ` +
+        `(e.g. "failed MemTest at 4800, bank 3")`, '') || '').trim();
+      if (!note) return;   // cancelled, or no reason given — the reason is the point
+    } else if (!confirm(`Clear the fault flag on ${ids.length} item(s)?`)) {
+      return;
+    }
+
+    let changed = 0;
+    for (const id of ids) {
+      const item = items.find(i => i.id === id);
+      if (!item || (itemCondition(item) === condition &&
+                    (item.condition_note || '') === note)) continue;
+      const body = { ...item, condition, condition_note: note };
+      delete body.id; delete body.createdAt; delete body.updatedAt; delete body.modified_by;
+      try {
+        const updated = await putItem(item, body);
+        items[items.findIndex(i => i.id === id)] = updated;
+        changed++;
+      } catch { /* apiFetch already surfaced it; keep going through the batch */ }
+    }
+    renderTable();
+    updateSelectionUI();
+    showToast(`${changed} item(s) marked ${condition}.`);
+  }
 
   function normalizeRank(rank) {
     // Extract and normalize rank from anywhere in the string (2rx4, 2RX4, "2Rx4 RDIMM" → "2Rx4")
@@ -2367,7 +2461,8 @@
   }
 
   const _SEARCH_FIELDS = ['vendor','name','part_number','serial_number','category',
-                          'location','tray','team','owner','checkout_user','rcd','pmic'];
+                          'location','tray','team','owner','checkout_user','rcd','pmic',
+                          'condition','condition_note'];
 
   // One lowercased string per item, built once and cached on the item. The
   // filter used to call .toLowerCase() on twelve fields of every item on every
@@ -2494,9 +2589,17 @@
             case 'tray':          return esc(item.tray)      || dash;
             case 'team':          return esc(item.team)      || dash;
             case 'owner':         return esc(item.owner)     || dash;
-            case 'checkout_user': return item.checkout_user
-              ? `<span class="status-badge status-checkedout">${esc(item.checkout_user)}</span>`
-              : '<span class="status-badge status-available">Available</span>';
+            case 'condition':     return conditionBadge(item) || dash;
+            case 'checkout_user': {
+              // Condition rides alongside the check-out state rather than
+              // replacing it: a faulty item is often one somebody is holding,
+              // and hiding either half loses the useful half.
+              const held = item.checkout_user
+                ? `<span class="status-badge status-checkedout">${esc(item.checkout_user)}</span>`
+                : '<span class="status-badge status-available">Available</span>';
+              const fault = conditionBadge(item);
+              return fault ? `${held} ${fault}` : held;
+            }
             case 'checkout_date': return esc(item.checkout_date) || dash;
             case 'loan_until': {
               const d = getEffectiveLoanDate(item);
@@ -2697,6 +2800,20 @@
     if (!/^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$/.test(email)) {
       alert(`"${email}" is not a valid email address.`);
       return;
+    }
+
+    // Warn, don't block: checking out a known-bad part to reproduce a failure
+    // is normal validation work. The point is that nobody does it by accident.
+    const faulty = checkoutTargetIds
+      .map(id => items.find(i => i.id === id))
+      .filter(it => it && isFaulty(it));
+    if (faulty.length) {
+      const list = faulty.slice(0, 5)
+        .map(it => `  • ${it.name}${it.condition_note ? ` — ${it.condition_note}` : ''}`)
+        .join('\n');
+      const more = faulty.length > 5 ? `\n  …and ${faulty.length - 5} more` : '';
+      if (!confirm(`${faulty.length} of these items ${faulty.length === 1 ? 'is' : 'are'} `
+                 + `marked BAD:\n\n${list}${more}\n\nCheck out anyway?`)) return;
     }
 
     const loanUntil = document.getElementById('co-loan-until').value.trim();
@@ -2955,6 +3072,9 @@
     document.getElementById('f-checkout-email').value = item?.checkout_email || '';
     document.getElementById('f-checkout-date').value  = item?.checkout_date  || '';
     document.getElementById('f-loan-until').value     = item?.loan_until     || '';
+    document.getElementById('f-condition').value      = itemCondition(item || {});
+    document.getElementById('f-condition-note').value = item?.condition_note || '';
+    onConditionChange();
     document.getElementById('f-notes').value          = item?.notes         || '';
     document.getElementById('row-name').classList.remove('has-error');
     document.getElementById('modal-overlay').classList.add('open');
@@ -2994,6 +3114,8 @@
       checkout_email: document.getElementById('f-checkout-email').value.trim(),
       checkout_date:  document.getElementById('f-checkout-date').value.trim(),
       loan_until:     document.getElementById('f-loan-until').value.trim(),
+      condition:      document.getElementById('f-condition').value,
+      condition_note: document.getElementById('f-condition-note').value.trim(),
       notes:         document.getElementById('f-notes').value.trim(),
     };
 
@@ -3089,6 +3211,8 @@
     owner:         ['owner','owned by','owner name','asset owner','responsible'],
     checkout_user: ['check out user','checkout user','checked out by','checked out to','borrowed by','issued to','checkout','checked out','borrower'],
     checkout_email:['check out email','checkout email','borrower email','borrower e mail'],
+    condition:     ['condition','state','health','status'],
+    condition_note:['condition note','fault','fault note','failure','failure reason','defect'],
     checkout_date: ['check out date','checkout date','check out date yyyy mm dd','date checked out','issue date','borrow date','borrowed on','checkout on'],
     loan_until:    ['loan until','loan until yyyy mm dd','loan end date','loan date','due date','return date','return by','due back','loan end','borrow until','return on'],
     notes:         ['notes','note','remark','remarks','comment','comments','memo','info','additional info'],
@@ -3188,6 +3312,8 @@
       checkout_email: String(get('checkout_email')).trim(),
       checkout_date:  String(get('checkout_date')).trim(),
       loan_until:     String(get('loan_until')).trim(),
+      condition:      String(get('condition')).trim(),
+      condition_note: String(get('condition_note')).trim(),
       notes:         String(get('notes')).trim(),
     };
   }
@@ -3454,6 +3580,17 @@
     const availableForReturn = [...selectedIds].filter(id => { const it = items.find(i => i.id === id); return it && !!it.checkout_user && !!(it.checkout_email||'').trim(); }).length;
     document.getElementById('return-req-count').textContent = availableForReturn;
     document.getElementById('return-req-btn').classList.toggle('visible', availableForReturn > 0 && isSuperAdmin);
+    // Fault actions: offer whichever transitions the selection can actually make.
+    const selected   = [...selectedIds].map(id => items.find(i => i.id === id)).filter(Boolean);
+    const notBad     = selected.filter(i => itemCondition(i) !== 'Bad').length;
+    const notSuspect = selected.filter(i => itemCondition(i) !== 'Suspect').length;
+    const flagged    = selected.filter(i => itemCondition(i) !== 'Good').length;
+    document.getElementById('mark-bad-count').textContent = notBad;
+    document.getElementById('mark-bad-btn').classList.toggle('visible', notBad > 0 && isAdmin);
+    document.getElementById('mark-suspect-count').textContent = notSuspect;
+    document.getElementById('mark-suspect-btn').classList.toggle('visible', notSuspect > 0 && isAdmin);
+    document.getElementById('mark-good-count').textContent = flagged;
+    document.getElementById('mark-good-btn').classList.toggle('visible', flagged > 0 && isAdmin);
     document.getElementById('toolbar-sel').classList.toggle('has-selection', count > 0);
 
     // sync select-all checkbox
@@ -3660,11 +3797,11 @@
     }
 
     const t = d.totals;
-    const pct = n => t.items ? `${(100 * n / t.items).toFixed(1)}%` : '—';
 
     const headline = `<div class="report-stats">
       ${[['Items', t.items], ['Available', t.available],
-         ['Checked out', t.checked_out], ['Distinct part numbers', t.part_numbers]]
+         ['Checked out', t.checked_out], ['Bad', t.bad ?? 0],
+         ['Suspect', t.suspect ?? 0], ['Distinct part numbers', t.part_numbers]]
         .map(([label, value]) => `<div class="report-stat">
             <span class="report-stat-value">${value.toLocaleString()}</span>
             <span class="report-stat-label">${esc(label)}</span>
@@ -3672,10 +3809,43 @@
     </div>`;
 
     const byCategory = _reportTable(
-      ['Category', 'Total', 'Available', 'Checked out', '% of stock'],
-      d.by_category.map(c => [esc(c.category || '(none)'), c.total, c.available,
-                              c.checked_out, pct(c.total)]),
+      ['Category', 'Total', 'Available', 'Checked out', 'Bad', 'Suspect'],
+      d.by_category.map(c => [
+        esc(c.category || '(none)'), c.total, c.available, c.checked_out,
+        c.bad ? `<span style="color:var(--danger)">${c.bad}</span>` : '0',
+        c.suspect || '0',
+      ]),
       'No items.');
+
+    const faultsByPart = _reportTable(
+      ['Part number', 'Example item', 'Bad', 'Suspect', 'Of total', 'Failure rate'],
+      (d.faults_by_part || []).map(f => [
+        esc(f.part_number), esc((f.example_name || '').slice(0, 40)),
+        `<span style="color:var(--danger)">${f.bad}</span>`, f.suspect, f.total,
+        f.total ? `${(100 * f.bad / f.total).toFixed(1)}%` : '—',
+      ]),
+      'Nothing has been marked Bad or Suspect yet.');
+
+    const faultsByVendor = _reportTable(
+      ['Vendor', 'Bad', 'Suspect', 'Of total', 'Failure rate'],
+      (d.faults_by_vendor || []).map(f => [
+        esc(f.vendor), `<span style="color:var(--danger)">${f.bad}</span>`,
+        f.suspect, f.total,
+        f.total ? `${(100 * f.bad / f.total).toFixed(2)}%` : '—',
+      ]),
+      'No faults recorded.');
+
+    const faulty = _reportTable(
+      ['Item', 'Condition', 'What is wrong', 'Marked by'],
+      (d.faulty || []).map(f => [
+        esc(f.name),
+        f.condition === 'Bad'
+          ? '<span class="status-badge status-bad">BAD</span>'
+          : '<span class="status-badge status-suspect">SUSPECT</span>',
+        esc(f.condition_note || '—'),
+        esc(f.modified_by || '—'),
+      ]),
+      'Nothing is flagged.');
 
     const byTeam = _reportTable(
       ['Team', 'Total', 'Checked out'],
@@ -3731,6 +3901,11 @@
       + _reportCard(`Low stock — ${d.low_stock_threshold} or fewer available`, lowStock,
           'Part numbers most likely to block someone who needs one today.')
       + _reportCard('Overdue', overdue)
+      + _reportCard('Faulty items', faulty,
+          'Availability counts and low-stock figures already exclude these.')
+      + _reportCard('Failures by part number', faultsByPart,
+          'A part number failing repeatedly is worth raising with the vendor.')
+      + _reportCard('Failures by vendor', faultsByVendor)
       + _reportCard('By team', byTeam)
       + _reportCard('Largest holdings', mostHeld)
       + _reportCard('Data gaps', gaps,

@@ -308,6 +308,23 @@ _CAT_NORM: dict[str, str] = {
     for c in _CANONICAL_CATEGORIES
 }
 
+# Physical condition, tracked separately from check-out state so an item can be
+# both checked out and faulty — which is exactly how a fault is usually found.
+#   Good    — fit for use (the default, and what a blank value means)
+#   Suspect — failed once, needs retesting; still on the shelf, but flagged
+#   Bad     — confirmed faulty
+_CONDITIONS = ["Good", "Suspect", "Bad"]
+_CONDITION_NORM = {c.lower(): c for c in _CONDITIONS}
+
+
+def _normalize_condition(raw: str | None) -> str:
+    """Blank reads as Good, so the 9.7k rows that predate this column need no backfill."""
+    key = str(raw or "").strip().lower()
+    if not key:
+        return "Good"
+    return _CONDITION_NORM.get(key, str(raw).strip())
+
+
 def _normalize_category(raw: str | None) -> str:
     if not raw:
         return raw or ""
@@ -326,6 +343,7 @@ _ITEM_FIELDS = [
     "rank", "speed", "capacity", "density", "dimm_type", "rcd", "pmic", "category",
     "location", "tray", "team", "owner",
     "checkout_user", "checkout_email", "checkout_date", "loan_until",
+    "condition", "condition_note",
     "notes", "modified_by", "createdAt", "updatedAt",
 ]
 
@@ -360,12 +378,36 @@ def _init_db() -> None:
             ("dimm_type", "TEXT NOT NULL DEFAULT ''"),
             ("rcd",       "TEXT NOT NULL DEFAULT ''"),
             ("pmic",      "TEXT NOT NULL DEFAULT ''"),
+            # Physical condition, independent of check-out state: an item can be
+            # both out and faulty. Existing rows get '', which reads as Good.
+            ("condition",      "TEXT NOT NULL DEFAULT ''"),
+            ("condition_note", "TEXT NOT NULL DEFAULT ''"),
         ]:
             try:
-                conn.execute(f"ALTER TABLE items ADD COLUMN {col} {definition}")
-            except _sqlite3.OperationalError:
-                pass  # column already exists
+                conn.execute(f'ALTER TABLE items ADD COLUMN "{col}" {definition}')
+            except _sqlite3.OperationalError as exc:
+                # Only "already there" is an acceptable failure. The old blanket
+                # except also swallowed "database is locked", silently skipping
+                # the migration and leaving the app running against a schema it
+                # believed it had.
+                if "duplicate column" not in str(exc).lower():
+                    raise
         conn.commit()
+
+        # Verify every expected column exists. This matters more than it looks:
+        # SQLite resolves a double-quoted identifier that matches no column to a
+        # *string literal* rather than failing, so SELECT "condition" on a table
+        # without that column quietly returns the text "condition" for every row.
+        # A migration that silently did not run would therefore surface as bad
+        # data, not as an error.
+        present = {row[1] for row in conn.execute("PRAGMA table_info(items)")}
+        missing = [f for f in _ITEM_FIELDS if f not in present]
+        if missing:
+            raise RuntimeError(
+                f"items table is missing column(s): {', '.join(missing)}. "
+                f"The schema migration did not complete; refusing to start "
+                f"rather than read string literals as data."
+            )
 
 
 def _migrate_from_json() -> None:
@@ -427,7 +469,8 @@ def _read() -> list[dict]:
     result = []
     for row in rows:
         item = dict(row)
-        item["category"] = _normalize_category(item.get("category", ""))
+        item["category"]  = _normalize_category(item.get("category", ""))
+        item["condition"] = _normalize_condition(item.get("condition", ""))
         result.append(item)
     return result
 
@@ -487,7 +530,8 @@ def _update_item_row(item_id: str, changes: dict) -> dict | None:
                 [str(merged.get(f) or "") for f in _UPDATABLE_FIELDS] + [item_id],
             )
             conn.commit()
-    merged["category"] = _normalize_category(merged.get("category", ""))
+    merged["category"]  = _normalize_category(merged.get("category", ""))
+    merged["condition"] = _normalize_condition(merged.get("condition", ""))
     return merged
 
 
@@ -578,6 +622,14 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# Prepare the database at import, not only under __main__. Both calls are
+# idempotent, and doing it here means any entry point that loads this module —
+# `uvicorn server:app`, a test client, a maintenance script — gets a migrated
+# schema instead of querying columns that were never added.
+_init_db()
+_migrate_from_json()
+
+
 # ── schemas ───────────────────────────────────────────────────────────────────
 
 class LoginIn(BaseModel):
@@ -597,6 +649,7 @@ class LoginIn(BaseModel):
 # Caps are generous — they exist to stop absurd input, not to police content.
 _FIELD_MAX_CHARS: dict[str, int] = {
     "name": 300, "notes": 4000, "serial_number": 300, "part_number": 200,
+    "condition_note": 1000,
 }
 _DEFAULT_FIELD_MAX = 200
 
@@ -650,6 +703,8 @@ class ItemIn(BaseModel):
     checkout_email: str | None = ""
     checkout_date: str | None = ""
     loan_until: str | None = ""   # ISO date YYYY-MM-DD
+    condition: str | None = ""        # Good | Suspect | Bad; blank reads as Good
+    condition_note: str | None = ""   # why — "failed MemTest at 4800, bank 3"
     notes: str | None = ""
 
     @model_validator(mode="before")
@@ -684,6 +739,17 @@ class ItemIn(BaseModel):
             )
         return normalized
 
+    @field_validator("condition")
+    @classmethod
+    def _known_condition(cls, v: str | None) -> str:
+        normalized = _normalize_condition(v)
+        if normalized not in _CONDITIONS:
+            raise ValueError(
+                f"Unknown condition {str(v).strip()!r}. Expected one of: "
+                + ", ".join(_CONDITIONS)
+            )
+        return normalized
+
     @field_validator("checkout_email")
     @classmethod
     def _valid_email(cls, v: str | None) -> str:
@@ -713,6 +779,13 @@ class ItemIn(BaseModel):
         if self.checkout_date and self.loan_until and self.loan_until < self.checkout_date:
             raise ValueError(
                 f"Loan Until ({self.loan_until}) is before Check Out Date ({self.checkout_date})."
+            )
+        # A bare "Bad" ages into a mystery: nobody later knows what failed or how.
+        # The reason is the entire value of the flag, so it is required with it.
+        if self.condition in ("Bad", "Suspect") and not (self.condition_note or "").strip():
+            raise ValueError(
+                f"Say what is wrong with it: a reason is required when condition is "
+                f"{self.condition} (for example 'failed MemTest at 4800, bank 3')."
             )
         return self
 
@@ -908,7 +981,8 @@ def create_item(body: ItemIn, creds: HTTPAuthorizationCredentials | None = Depen
     if actor:
         item["modified_by"] = actor
     _insert_items([item])
-    item["category"] = _normalize_category(item.get("category", ""))
+    item["category"]  = _normalize_category(item.get("category", ""))
+    item["condition"] = _normalize_condition(item.get("condition", ""))
     return item
 
 
@@ -1033,6 +1107,11 @@ def batch_delete_items(body: BatchDeleteIn):
 # client is what the Reports view exists to replace.
 
 _SQL_CHECKED_OUT = "trim(checkout_user) <> ''"
+# A faulty part is not stock, however it is shelved. Blank condition means Good,
+# so this has to test for the fault rather than for the absence of 'Good'.
+_SQL_BAD = "lower(trim(condition)) = 'bad'"
+_SQL_SUSPECT = "lower(trim(condition)) = 'suspect'"
+_SQL_USABLE = f"NOT ({_SQL_BAD})"
 
 
 @app.get("/api/reports/summary", dependencies=[Depends(_require_admin)])
@@ -1049,15 +1128,18 @@ def reports_summary(low_stock_threshold: int = Query(default=3, ge=0, le=1000)):
 
         by_category = rows(f"""
             SELECT category,
-                   COUNT(*)                                    AS total,
-                   SUM(CASE WHEN {_SQL_CHECKED_OUT} THEN 1 ELSE 0 END) AS checked_out
+                   COUNT(*)                                             AS total,
+                   SUM(CASE WHEN {_SQL_CHECKED_OUT} THEN 1 ELSE 0 END)  AS checked_out,
+                   SUM(CASE WHEN {_SQL_BAD} THEN 1 ELSE 0 END)          AS bad,
+                   SUM(CASE WHEN {_SQL_SUSPECT} THEN 1 ELSE 0 END)      AS suspect,
+                   SUM(CASE WHEN {_SQL_USABLE} AND NOT ({_SQL_CHECKED_OUT})
+                            THEN 1 ELSE 0 END)                          AS available
               FROM items
              GROUP BY category
              ORDER BY total DESC
         """)
         for row in by_category:
             row["category"] = _normalize_category(row["category"])
-            row["available"] = row["total"] - row["checked_out"]
 
         by_team = rows(f"""
             SELECT CASE WHEN trim(team) = '' THEN '(none)' ELSE team END AS team,
@@ -1074,7 +1156,9 @@ def reports_summary(low_stock_threshold: int = Query(default=3, ge=0, le=1000)):
             SELECT trim(part_number) AS part_number,
                    MIN(name)                                   AS example_name,
                    COUNT(*)                                    AS total,
-                   SUM(CASE WHEN {_SQL_CHECKED_OUT} THEN 0 ELSE 1 END) AS available
+                   SUM(CASE WHEN {_SQL_USABLE} AND NOT ({_SQL_CHECKED_OUT})
+                            THEN 1 ELSE 0 END)                          AS available,
+                   SUM(CASE WHEN {_SQL_BAD} THEN 1 ELSE 0 END)          AS bad
               FROM items
              WHERE trim(part_number) <> ''
              GROUP BY 1
@@ -1107,6 +1191,45 @@ def reports_summary(low_stock_threshold: int = Query(default=3, ge=0, le=1000)):
 
         total = one("SELECT COUNT(*) FROM items")
         checked_out = one(f"SELECT COUNT(*) FROM items WHERE {_SQL_CHECKED_OUT}")
+        bad = one(f"SELECT COUNT(*) FROM items WHERE {_SQL_BAD}")
+        suspect = one(f"SELECT COUNT(*) FROM items WHERE {_SQL_SUSPECT}")
+        available = one(
+            f"SELECT COUNT(*) FROM items WHERE {_SQL_USABLE} AND NOT ({_SQL_CHECKED_OUT})"
+        )
+
+        # Failure rate per part number and per vendor — the signal a validation
+        # lab actually wants out of marking things bad.
+        faults_by_part = rows(f"""
+            SELECT trim(part_number) AS part_number,
+                   MIN(name)                                   AS example_name,
+                   COUNT(*)                                    AS total,
+                   SUM(CASE WHEN {_SQL_BAD} THEN 1 ELSE 0 END) AS bad,
+                   SUM(CASE WHEN {_SQL_SUSPECT} THEN 1 ELSE 0 END) AS suspect
+              FROM items
+             WHERE trim(part_number) <> ''
+             GROUP BY 1
+            HAVING bad > 0 OR suspect > 0
+             ORDER BY bad DESC, suspect DESC
+             LIMIT 25
+        """)
+        faults_by_vendor = rows(f"""
+            SELECT CASE WHEN trim(vendor) = '' THEN '(none)' ELSE vendor END AS vendor,
+                   COUNT(*)                                    AS total,
+                   SUM(CASE WHEN {_SQL_BAD} THEN 1 ELSE 0 END) AS bad,
+                   SUM(CASE WHEN {_SQL_SUSPECT} THEN 1 ELSE 0 END) AS suspect
+              FROM items
+             GROUP BY 1
+            HAVING bad > 0 OR suspect > 0
+             ORDER BY bad DESC
+        """)
+        faulty = rows(f"""
+            SELECT id, name, part_number, serial_number, category,
+                   condition, condition_note, modified_by, updatedAt
+              FROM items
+             WHERE {_SQL_BAD} OR {_SQL_SUSPECT}
+             ORDER BY CASE WHEN {_SQL_BAD} THEN 0 ELSE 1 END, updatedAt DESC
+             LIMIT 100
+        """)
 
         # Gaps worth acting on, each phrased as a count of rows.
         gaps = {
@@ -1125,7 +1248,9 @@ def reports_summary(low_stock_threshold: int = Query(default=3, ge=0, le=1000)):
         "totals": {
             "items": total,
             "checked_out": checked_out,
-            "available": total - checked_out,
+            "available": available,   # excludes faulty units
+            "bad": bad,
+            "suspect": suspect,
             "part_numbers": len(stock),
         },
         "by_category": by_category,
@@ -1135,6 +1260,9 @@ def reports_summary(low_stock_threshold: int = Query(default=3, ge=0, le=1000)):
         "low_stock_threshold": low_stock_threshold,
         "most_held": most_held,
         "overdue": overdue,
+        "faults_by_part": faults_by_part,
+        "faults_by_vendor": faults_by_vendor,
+        "faulty": faulty,
         "gaps": gaps,
     }
 
@@ -1853,6 +1981,8 @@ def download_template():
         ("DIMM Type (ES/CS)",               "dimm_type",      14, False, False),
         ("RCD",                             "rcd",            16, False, False),
         ("PMIC",                            "pmic",           16, False, False),
+        ("Condition",                       "condition",      12, False, False),
+        ("Condition Note",                  "condition_note", 28, False, False),
         ("Location *",                      "location",       18, True,  False),
         ("Tray / Comment",                  "tray",           18, False, False),
         ("Team *",                          "team",           16, True,  False),
@@ -2063,6 +2193,8 @@ def export_inventory(
         ("DIMM Type",        "dimm_type",      12),
         ("RCD",              "rcd",            16),
         ("PMIC",             "pmic",           16),
+        ("Condition",        "condition",      12),
+        ("Condition Note",   "condition_note", 28),
         ("Location",         "location",       18),
         ("Tray / Comment",   "tray",           18),
         ("Team",             "team",           16),
@@ -2186,8 +2318,7 @@ app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
 if __name__ == "__main__":
     import uvicorn
-    _init_db()
-    _migrate_from_json()
+    # _init_db() / _migrate_from_json() already ran at import.
     configured = str(_CONFIGURED_DIR)
     actual     = str(DATA_DIR.resolve())
     print(f"  Data dir  : {actual}" + (" (FALLBACK — shared drive unavailable)" if actual != str(_CONFIGURED_DIR.resolve()) else ""))
