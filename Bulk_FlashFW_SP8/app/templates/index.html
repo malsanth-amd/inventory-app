@@ -31,18 +31,18 @@
   {% for board in board_codes %}
   <details class="fw-override">
     <summary>{{ board }}</summary>
-    <div class="fw-override-grid">
-      {% for component, label in [("bios", "BIOS"), ("bmc", "BMC"), ("hpm", "FPGA (HPM)")] %}
-      <div class="fw-override-field">
-        <label>{{ label }} file
-          <input type="file" class="fw-file" data-board="{{ board }}" data-component="{{ component }}">
-        </label>
-        <label>{{ label }} version (optional, for verification only)
-          <input type="text" class="fw-version" data-board="{{ board }}" data-component="{{ component }}">
-        </label>
-      </div>
-      {% endfor %}
-    </div>
+    <table class="fw-override-table">
+      <thead><tr><th>Component</th><th>File</th><th>Version</th></tr></thead>
+      <tbody>
+        {% for component, label in [("bios", "BIOS"), ("bmc", "BMC"), ("hpm", "FPGA (HPM)")] %}
+        <tr>
+          <td>{{ label }}</td>
+          <td><input type="file" class="fw-file" data-board="{{ board }}" data-component="{{ component }}"></td>
+          <td><input type="text" class="fw-version" placeholder="optional" data-board="{{ board }}" data-component="{{ component }}"></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
   </details>
   {% endfor %}
 </section>
