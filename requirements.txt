@@ -9,5 +9,12 @@ python-multipart>=0.0.12
 pandas>=2.0.0
 xlrd>=2.0.1
 
+# ppin_sn.py only — SSH to a SUT's BMC. Not needed to run the server.
+paramiko>=3.4.0
+
+# Nightly DIMM audit scan only — auto-grab OS IP + SSH to the SUT's OS to run
+# dmidecode. Not needed to run the server otherwise.
+asyncssh>=2.14.0
+
 # Test suite (pytest -q). Not needed to run the server.
 pytest>=8.0.0

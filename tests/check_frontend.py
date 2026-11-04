@@ -27,6 +27,18 @@ EXPECTED_FUNCTIONS = [
     "onScan", "setScanStatus", "resetScanCount",
     "onSearchInput", "searchBlob", "compareValues", "magnitude",
     "putItem", "formatApiError", "renderTable",
+    "_reportTable", "_borrowerDetail", "buildMatchIndex",
+    "parseActionRows", "actionRowToUpdate", "renderActionRowsPreview",
+    "flagDuplicateActionTargets", "autoLookupRcdPmic", "_cpuInventoryPanel",
+    "_findCpuBySerial", "_recordSutAudit", "openAuditHistory", "closeAuditHistory",
+    "readSutDimms", "clearDimmDecoder", "_dimmResults", "_dimmInventoryPanel", "_recordDimmAudit",
+    "exportAuditLog",
+    "runAuditScanNow", "loadLastAuditScanRun", "runDimmScanNow", "loadLastDimmScanRun",
+    "_renderScanRunSummary",
+    "landingAggregates", "renderLanding", "renderLandingStock", "applyFacet",
+    "isAvailable", "_renderActiveFilters", "browseAllItems",
+    "rowIsBulkAction", "detectColMap", "doImport", "handleFile",
+    "collectImportRows", "importDateIsValid", "dateColumnProblems",
 ]
 
 BACKSLASH = chr(92)
@@ -34,38 +46,148 @@ QUOTES = {'"', "'", "`"}
 
 
 def strip_literals(body: str) -> str:
-    """Remove comments and string literals so bracket counts mean something."""
+    """Remove comments and string literals so bracket counts mean something.
+
+    Template literals need a stack rather than a flag. Treating everything
+    between two backticks as opaque works until a template contains another one
+    inside a ${...} substitution: the scanner then pairs the opening backtick
+    with the *nested* one, and the rest of the file is read inside-out. That is
+    not hypothetical — it made the whole-file count swing by one purely because
+    a render function was rewritten to nest fewer templates, reporting a dropped
+    bracket in code the browser parsed without complaint.
+
+    So: literal text inside a template is dropped, but the code inside ${...} is
+    kept and scanned as code, which is what it is. The ${ and its matching }
+    are delimiters, not braces, and are not emitted.
+    """
     out: list[str] = []
-    i, n, state = 0, len(body), None
+    # Frames: ("code", unmatched_braces) or ("tpl", 0). The outermost code frame
+    # is never popped.
+    stack: list[list] = [["code", 0]]
+    state = None            # None | "line" | "block" | "'" | '"'
+    i, n = 0, len(body)
+
+    def starts_regex() -> bool:
+        """Whether the '/' at *i* opens a regex rather than dividing.
+
+        Decided by what came before it: a value (identifier, number, closing
+        bracket) means division, anything else means a pattern. Without this,
+        `.replace(/&/g, '&amp;')` reads as division and the quotes inside the
+        next pattern re-open string state, so the scanner spends the rest of
+        the file inside-out — which is where the "meaningless absolute number"
+        in this module's docstring came from.
+        """
+        k = len(out) - 1
+        while k >= 0 and out[k].isspace():
+            k -= 1
+        if k < 0:
+            return True
+        prev = out[k]
+        if prev in ")]":
+            return False
+        if prev.isalnum() or prev in "_$":
+            # A value ends the expression — unless it is a keyword that takes one.
+            word_end = k + 1
+            while k >= 0 and (out[k].isalnum() or out[k] in "_$"):
+                k -= 1
+            word = "".join(out[k + 1:word_end])
+            return word in {"return", "typeof", "instanceof", "in", "of", "new",
+                            "delete", "void", "case", "do", "else", "yield", "await"}
+        return True
+
     while i < n:
         ch = body[i]
         nxt = body[i + 1] if i + 1 < n else ""
-        if state is None:
-            if ch + nxt == "//":
-                state, i = "line", i + 2
-                continue
-            if ch + nxt == "/*":
-                state, i = "block", i + 2
-                continue
-            if ch in QUOTES:
-                state, i = ch, i + 1
-                continue
-            out.append(ch)
-        elif state == "line":
+
+        if state == "line":
             if ch == "\n":
                 state = None
                 out.append(ch)
-        elif state == "block":
+            i += 1
+            continue
+        if state == "block":
             if ch + nxt == "*/":
                 state, i = None, i + 2
                 continue
-        else:  # inside a string literal
+            i += 1
+            continue
+        if state in ("'", '"'):
             if ch == BACKSLASH:
                 i += 2
                 continue
             if ch == state:
                 state = None
+            i += 1
+            continue
+
+        if stack[-1][0] == "tpl":
+            if ch == BACKSLASH:
+                i += 2
+                continue
+            if ch == "`":                      # template ends
+                stack.pop()
+                i += 1
+                continue
+            if ch + nxt == "${":               # substitution: code again
+                stack.append(["code", 0])
+                i += 2
+                continue
+            i += 1                             # literal text — drop it
+            continue
+
+        # inside code
+        if ch + nxt == "//":
+            state, i = "line", i + 2
+            continue
+        if ch + nxt == "/*":
+            state, i = "block", i + 2
+            continue
+        if ch in ("'", '"'):
+            state, i = ch, i + 1
+            continue
+        if ch == "`":
+            stack.append(["tpl", 0])
+            i += 1
+            continue
+        if ch == "/" and starts_regex():
+            i += 1
+            in_class = False
+            while i < n:
+                c = body[i]
+                if c == BACKSLASH:
+                    i += 2
+                    continue
+                if c == "[":
+                    in_class = True
+                elif c == "]":
+                    in_class = False
+                elif c == "/" and not in_class:
+                    i += 1
+                    break
+                elif c == "\n":          # unterminated: not a regex after all
+                    break
+                i += 1
+            while i < n and body[i].isalpha():   # flags
+                i += 1
+            continue
+        if ch == "{":
+            stack[-1][1] += 1
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "}":
+            if stack[-1][1] > 0:
+                stack[-1][1] -= 1
+                out.append(ch)
+            elif len(stack) > 1:
+                stack.pop()                    # closes a ${...}: a delimiter
+            else:
+                out.append(ch)                 # genuinely unmatched — let it count
+            i += 1
+            continue
+        out.append(ch)
         i += 1
+
     return "".join(out)
 
 

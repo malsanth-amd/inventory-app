@@ -202,3 +202,202 @@ def test_csv_parsing(client, auth):
     rows = resp.json()["sheets"][0]["rows"]
     assert rows[0] == ["Item Description", "Part Number"]
     assert rows[1] == ["Widget", "PN-1"]
+
+
+# ── speed from the decoder ────────────────────────────────────────────────────
+#
+# Speed joined rcd/pmic in this path later: the decoder derives it from the part
+# number, and the stored column disagreed with it on every DIMM in the table —
+# 4800/5600 against a decoder that reads 12800 off the part number.
+
+def test_bulk_fill_writes_speed_into_a_blank_column(client, auth, make_item):
+    pn = "TEST-PN-SPEED-0001"
+    make_item(name="no speed", part_number=pn, category="DIMMs")
+
+    resp = client.post("/api/items/bulk-rcd-pmic",
+                       json={"updates": {pn: {"speed": "12800"}}}, headers=auth)
+    assert resp.json()["updated"] == 1
+
+    row = next(i for i in client.get("/api/items").json() if i["part_number"] == pn)
+    # The column reads "4800 MT/s" everywhere else; a bare number gains the unit.
+    assert row["speed"] == "12800 MT/s"
+
+
+def test_bulk_fill_leaves_a_stored_speed_alone(client, auth, make_item):
+    """Fill mode is what the background auto-fill runs; it must not rewrite."""
+    pn = "TEST-PN-SPEED-0002"
+    make_item(name="has speed", part_number=pn, category="DIMMs", speed="4800 MT/s")
+
+    client.post("/api/items/bulk-rcd-pmic",
+                json={"updates": {pn: {"speed": "12800"}}}, headers=auth)
+
+    row = next(i for i in client.get("/api/items").json() if i["part_number"] == pn)
+    assert row["speed"] == "4800 MT/s"
+
+
+def test_overwrite_replaces_a_stored_speed(client, auth, make_item):
+    """What the Refresh from decoder button is for."""
+    pn = "TEST-PN-SPEED-0003"
+    make_item(name="stale speed", part_number=pn, category="DIMMs", speed="4800 MT/s")
+
+    resp = client.post("/api/items/bulk-rcd-pmic",
+                       json={"updates": {pn: {"speed": "12800"}}, "overwrite": True},
+                       headers=auth)
+    assert resp.json()["updated"] == 1
+
+    row = next(i for i in client.get("/api/items").json() if i["part_number"] == pn)
+    assert row["speed"] == "12800 MT/s"
+
+
+def test_speed_only_update_is_idempotent(client, auth, make_item):
+    pn = "TEST-PN-SPEED-0004"
+    make_item(name="twice", part_number=pn, category="DIMMs", speed="4800 MT/s")
+    payload = {"updates": {pn: {"speed": "12800"}}, "overwrite": True}
+
+    assert client.post("/api/items/bulk-rcd-pmic", json=payload, headers=auth).json()["updated"] == 1
+    assert client.post("/api/items/bulk-rcd-pmic", json=payload, headers=auth).json()["updated"] == 0
+
+
+def test_a_speed_that_already_carries_units_is_stored_as_given(client, auth, make_item):
+    pn = "TEST-PN-SPEED-0005"
+    make_item(name="units given", part_number=pn, category="DIMMs")
+    client.post("/api/items/bulk-rcd-pmic",
+                json={"updates": {pn: {"speed": "6400 MT/s"}}}, headers=auth)
+    row = next(i for i in client.get("/api/items").json() if i["part_number"] == pn)
+    assert row["speed"] == "6400 MT/s"
+
+
+def test_speed_is_written_for_dimms_only(client, auth, make_item):
+    """The statement is scoped to DIMMs; a CPU sharing a part number is not touched."""
+    pn = "TEST-PN-SPEED-0006"
+    make_item(name="a dimm", part_number=pn, category="DIMMs")
+    make_item(name="not a dimm", part_number=pn, category="CPU (Silicon)")
+
+    client.post("/api/items/bulk-rcd-pmic",
+                json={"updates": {pn: {"speed": "12800"}}, "overwrite": True}, headers=auth)
+
+    rows = {i["name"]: i for i in client.get("/api/items").json() if i["part_number"] == pn}
+    assert rows["a dimm"]["speed"] == "12800 MT/s"
+    assert rows["not a dimm"]["speed"] == ""
+
+
+def test_speed_travels_with_rcd_and_pmic(client, auth, make_item):
+    pn = "TEST-PN-SPEED-0007"
+    make_item(name="all three", part_number=pn, category="DIMMs",
+              rcd="STALE", pmic="STALE", speed="4800 MT/s")
+
+    client.post("/api/items/bulk-rcd-pmic",
+                json={"updates": {pn: {"rcd": "Montage B0", "pmic": "Richtek B3",
+                                       "speed": "12800"}},
+                      "overwrite": True},
+                headers=auth)
+
+    row = next(i for i in client.get("/api/items").json() if i["part_number"] == pn)
+    assert (row["rcd"], row["pmic"], row["speed"]) == ("Montage B0", "Richtek B3", "12800 MT/s")
+
+
+# ── exporting a selection ─────────────────────────────────────────────────────
+#
+# Ids used to travel as repeated `?ids=` query parameters. An id is 32 hex
+# characters, so selecting the whole table built a request line of a third of a
+# megabyte, which never reached the server: the admin saw "Export failed: Bad
+# Gateway". They go in the body now.
+
+def test_export_of_a_selection_posts_the_ids(client, auth, make_item):
+    ids = [make_item(name=f"posted {n}", category="DIMMs").json()["id"] for n in range(3)]
+    resp = client.post("/api/export", json={"ids": ids}, headers=auth)
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == XLSX_MIME
+    parsed = client.post("/api/parse-file",
+                         files={"file": ("e.xlsx", resp.content, XLSX_MIME)}, headers=auth)
+    assert parsed.status_code == 200
+
+
+def test_a_selection_too_large_for_a_url_still_exports(client, auth, make_item):
+    """The case that failed: more ids than a request line can carry."""
+    real = make_item(name="one real row", category="DIMMs").json()["id"]
+    # 5,000 ids is ~180 KB as a query string; as a body it is unremarkable.
+    ids = [real] + [f"{n:032x}" for n in range(5000)]
+    resp = client.post("/api/export", json={"ids": ids}, headers=auth)
+    assert resp.status_code == 200
+    assert len(resp.content) > 0
+
+
+def test_exporting_a_selection_that_matches_nothing_says_so(client, auth):
+    """It used to be a 500: openpyxl cannot save a workbook with no sheets."""
+    resp = client.post("/api/export", json={"ids": ["gone-1", "gone-2"]}, headers=auth)
+    assert resp.status_code == 404
+    assert "none of those items" in resp.json()["detail"]
+
+
+def test_the_get_form_still_works(client, auth, make_item):
+    """Links and bookmarks that carry a few ids keep working."""
+    item_id = make_item(name="get export", category="DIMMs").json()["id"]
+    assert client.get(f"/api/export?ids={item_id}").status_code == 200
+
+
+def test_exporting_everything_still_requires_admin(client):
+    assert client.post("/api/export", json={"ids": None}).status_code == 401
+    assert client.post("/api/export", json={}).status_code == 401
+
+
+def test_bulk_fill_writes_dimm_type(client, auth, make_item):
+    """MRDIMM / RDIMM, which the import never filled — blank on every row."""
+    pn = "TEST-PN-TYPE-0001"
+    make_item(name="no type", part_number=pn, category="DIMMs")
+
+    resp = client.post("/api/items/bulk-rcd-pmic",
+                       json={"updates": {pn: {"dimm_type": "MRDIMM"}}}, headers=auth)
+    assert resp.json()["updated"] == 1
+    row = next(i for i in client.get("/api/items").json() if i["part_number"] == pn)
+    assert row["dimm_type"] == "MRDIMM"
+
+
+def test_dimm_type_follows_the_same_fill_and_overwrite_rules(client, auth, make_item):
+    pn = "TEST-PN-TYPE-0002"
+    make_item(name="typed by hand", part_number=pn, category="DIMMs", dimm_type="ES")
+
+    client.post("/api/items/bulk-rcd-pmic",
+                json={"updates": {pn: {"dimm_type": "MRDIMM"}}}, headers=auth)
+    row = next(i for i in client.get("/api/items").json() if i["part_number"] == pn)
+    assert row["dimm_type"] == "ES", "fill mode overwrote a hand-entered value"
+
+    client.post("/api/items/bulk-rcd-pmic",
+                json={"updates": {pn: {"dimm_type": "MRDIMM"}}, "overwrite": True},
+                headers=auth)
+    row = next(i for i in client.get("/api/items").json() if i["part_number"] == pn)
+    assert row["dimm_type"] == "MRDIMM"
+
+
+def test_all_four_decoder_columns_travel_together(client, auth, make_item, app_module):
+    """One statement writes the lot; a parameter miscount would cross them over."""
+    assert app_module._DECODER_COLUMNS == ("rcd", "pmic", "speed", "dimm_type")
+    pn = "TEST-PN-ALL-0001"
+    make_item(name="all four", part_number=pn, category="DIMMs",
+              rcd="old", pmic="old", speed="4800 MT/s", dimm_type="old")
+
+    client.post("/api/items/bulk-rcd-pmic",
+                json={"updates": {pn: {"rcd": "Montage B0", "pmic": "Richtek B3",
+                                       "speed": "12800", "dimm_type": "MRDIMM"}},
+                      "overwrite": True},
+                headers=auth)
+
+    row = next(i for i in client.get("/api/items").json() if i["part_number"] == pn)
+    assert row["rcd"] == "Montage B0"
+    assert row["pmic"] == "Richtek B3"
+    assert row["speed"] == "12800 MT/s"
+    assert row["dimm_type"] == "MRDIMM"
+
+
+def test_a_decoder_update_of_one_column_leaves_the_others_alone(client, auth, make_item):
+    pn = "TEST-PN-ALL-0002"
+    make_item(name="only type", part_number=pn, category="DIMMs",
+              rcd="keep", pmic="keep", speed="4800 MT/s")
+
+    client.post("/api/items/bulk-rcd-pmic",
+                json={"updates": {pn: {"dimm_type": "RDIMM"}}, "overwrite": True},
+                headers=auth)
+
+    row = next(i for i in client.get("/api/items").json() if i["part_number"] == pn)
+    assert (row["rcd"], row["pmic"], row["speed"]) == ("keep", "keep", "4800 MT/s")
+    assert row["dimm_type"] == "RDIMM"

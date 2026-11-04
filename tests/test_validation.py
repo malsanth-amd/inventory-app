@@ -39,6 +39,9 @@ def test_blank_email_is_allowed_when_nobody_is_named(make_item):
         ("2026-03-05T09:30:00", "2026-03-05"),     # ISO with time
         ("2026/03/05", "2026-03-05"),              # slashes
         ("05-Mar-2026", "2026-03-05"),             # unambiguous text month
+        ("05 Mar 2026", "2026-03-05"),             # space-separated text month
+        ("Mar 05, 2026", "2026-03-05"),            # month-first text month
+        ("05 Mar 2026 00:00:00", "2026-03-05"),    # ...and with a time on it
         ("46086", "2026-03-05"),                   # Excel serial day number
         ("", ""),
     ],
@@ -168,22 +171,49 @@ def test_changing_borrower_requires_an_email(client, auth, app_module, make_item
 
 # ── batch import ──────────────────────────────────────────────────────────────
 
-def test_batch_reports_every_bad_row_at_once(client, auth):
-    rows = [
-        {"name": "good 1", "category": "DIMMs"},
-        {"name": "bad 1", "category": "DIMMs", "checkout_user": "Mega"},
-        {"name": "good 2", "category": "DIMMs",
-         "checkout_user": "Z", "checkout_email": "z@amd.com"},
-        {"name": "bad 2", "category": "DIMMs", "checkout_user": "Mega/Jackie"},
-    ]
-    before = len(client.get("/api/items").json())
-    resp = client.post("/api/items/batch", json={"items": rows}, headers=auth)
+def test_import_accepts_a_borrower_without_an_email(client, auth):
+    """Import is the one path that may record an uncontactable check-out.
 
-    assert resp.status_code == 422
-    detail = resp.json()["detail"]
-    assert [r["row"] for r in detail["rows"]] == [2, 4]
-    # all-or-nothing: a rejected batch must not leave partial rows behind
-    assert len(client.get("/api/items").json()) == before
+    A spreadsheet is usually a record of loans that already happened, with no
+    address ever captured. Refusing the file meant inventing addresses or not
+    recording the loans, and the second is what happened.
+    """
+    rows = [
+        {"name": "imported no email 1", "category": "DIMMs", "checkout_user": "Mega"},
+        {"name": "imported with email", "category": "DIMMs",
+         "checkout_user": "Z", "checkout_email": "z@amd.com"},
+        {"name": "imported no email 2", "category": "DIMMs", "checkout_user": "Mega/Jackie"},
+    ]
+    resp = client.post("/api/items/batch", json={"items": rows}, headers=auth)
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["imported"] == 3
+
+    stored = {i["name"]: i for i in client.get("/api/items").json()}
+    assert stored["imported no email 1"]["checkout_user"]  == "Mega"
+    assert stored["imported no email 1"]["checkout_email"] == ""
+
+    ids = [stored[r["name"]]["id"] for r in rows]
+    client.post("/api/items/batch-delete", json={"ids": ids}, headers=auth)
+
+
+def test_hand_entry_still_requires_an_email(client, auth, make_item):
+    """The exemption is import-only — naming a borrower by hand still costs one field."""
+    # single create
+    assert make_item(checkout_user="Mega").status_code == 422
+
+    # bulk check in/out, which is a batch-update and not an import
+    created = make_item(name="bulk co target").json()
+    resp = client.post(
+        "/api/items/batch-update",
+        json={"updates": [{
+            "id": created["id"],
+            "item": {**strip_server_fields(created), "checkout_user": "Mega",
+                     "checkout_email": "", "checkout_date": "2026-10-01"},
+            "expected_updated_at": created["updatedAt"],
+        }]},
+        headers=auth,
+    )
+    assert resp.status_code == 422, resp.text
 
 
 def test_clean_batch_imports(client, auth):

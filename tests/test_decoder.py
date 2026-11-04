@@ -47,9 +47,72 @@ def stub_decoder(monkeypatch):
     return install
 
 
-def test_requires_admin(client, stub_decoder):
+def test_anyone_may_look_up_a_part_number(client, stub_decoder):
+    """Open on purpose: reading a part number is not a privileged act.
+
+    It was closed because it was an unauthenticated passthrough onto an
+    internal service with the caller choosing the URL. The guards below are
+    what make it safe to leave open; writes are still admin-only.
+    """
     stub_decoder()
-    assert client.get("/api/lookup-pn/HMCG88CHJMA863N").status_code == 401
+    resp = client.get("/api/lookup-pn/HMCG88CHJMA863N")
+    assert resp.status_code == 200
+    assert resp.json()["rcd"] == "Montage A0"
+
+
+# ── the guards that let it stay open ──────────────────────────────────────────
+
+@pytest.mark.parametrize("bad,why", [
+    ("x%3Fadmin%3D1", "a query string on the internal service"),
+    ("%2E%2E", "climbing a path segment"),
+    ("a%20b", "whitespace"),
+    ("x%26y", "an extra parameter"),
+    ("x%25', 'percent", "double encoding"),
+    ("x" * 65, "absurd length"),
+])
+def test_part_numbers_that_could_steer_the_upstream_url_are_refused(client, stub_decoder, bad, why):
+    install = stub_decoder()
+    resp = client.get(f"/api/lookup-pn/{bad}")
+    assert resp.status_code == 400, f"{why} was accepted"
+    # Nothing left the server.
+    assert not hasattr(install, "requested_url"), f"{why} reached ddrmpn.amd.com"
+
+
+def test_a_repeat_lookup_never_leaves_the_server(client, stub_decoder, app_module):
+    install = stub_decoder()
+    first = client.get("/api/lookup-pn/HMCG88CHJMA863N")
+    assert first.status_code == 200
+    del install.requested_url                      # forget the first call
+
+    second = client.get("/api/lookup-pn/HMCG88CHJMA863N")
+    assert second.status_code == 200
+    assert second.json() == first.json()
+    assert not hasattr(install, "requested_url"), "a cached part number still called upstream"
+
+
+def test_an_unknown_part_number_is_remembered_too(client, stub_decoder):
+    """Otherwise a bad part number typed in a loop is an amplifier."""
+    install = stub_decoder(status=404)
+    assert client.get("/api/lookup-pn/NOSUCHPN").status_code == 404
+    del install.requested_url
+    assert client.get("/api/lookup-pn/NOSUCHPN").status_code == 404
+    assert not hasattr(install, "requested_url")
+
+
+def test_a_client_cannot_hammer_the_internal_service(client, stub_decoder, app_module):
+    stub_decoder()
+    limit = app_module._MAX_DECODES_PER_WINDOW
+    # Distinct part numbers, so every one is a cache miss and a real call.
+    for n in range(limit):
+        assert client.get(f"/api/lookup-pn/PN-{n}").status_code == 200, f"refused at {n}"
+    assert client.get(f"/api/lookup-pn/PN-{limit}").status_code == 429
+
+
+def test_cached_lookups_do_not_count_against_the_limit(client, stub_decoder, app_module):
+    stub_decoder()
+    assert client.get("/api/lookup-pn/SAME").status_code == 200
+    for _ in range(app_module._MAX_DECODES_PER_WINDOW * 2):
+        assert client.get("/api/lookup-pn/SAME").status_code == 200
 
 
 def test_returns_rcd_pmic_and_the_full_payload(client, auth, stub_decoder):
@@ -127,3 +190,55 @@ def test_live_decode(client, auth):
     body = client.get("/api/lookup-pn/HMCG88CHJMA863N", headers=auth).json()
     assert body["raw"]["Part Number"] == "HMCG88CHJMA863N"
     assert body["rcd"] and body["pmic"]
+
+
+def test_an_admin_is_not_throttled(client, auth, stub_decoder, app_module):
+    """The limit protects an internal service from anonymous callers.
+
+    It must not throttle the app's own work: "Refresh from decoder" looks up
+    every distinct part number at once — 117 in the live inventory — and a cap
+    of _MAX_DECODES_PER_WINDOW silently dropped most of them, which reached the
+    admin as the refresh quietly not working.
+    """
+    stub_decoder()
+    over = app_module._MAX_DECODES_PER_WINDOW * 4
+    for n in range(over):
+        resp = client.get(f"/api/lookup-pn/ADMIN-PN-{n}", headers=auth)
+        assert resp.status_code == 200, f"throttled at {n} with a token"
+
+
+def test_an_anonymous_caller_is_still_throttled(client, stub_decoder, app_module):
+    stub_decoder()
+    limit = app_module._MAX_DECODES_PER_WINDOW
+    for n in range(limit):
+        assert client.get(f"/api/lookup-pn/ANON-PN-{n}").status_code == 200
+    assert client.get(f"/api/lookup-pn/ANON-PN-{limit}").status_code == 429
+
+
+def test_a_bad_token_is_treated_as_anonymous(client, stub_decoder, app_module):
+    stub_decoder()
+    bad = {"Authorization": "Bearer not-a-real-token"}
+    limit = app_module._MAX_DECODES_PER_WINDOW
+    for n in range(limit):
+        assert client.get(f"/api/lookup-pn/BAD-PN-{n}", headers=bad).status_code == 200
+    assert client.get(f"/api/lookup-pn/BAD-PN-{limit}", headers=bad).status_code == 429
+
+
+@pytest.mark.parametrize("pn", [
+    "HMCGP4AHJMF870N(C)KR",     # the country segment written literally
+    "HMCG94CHJMAA0PN©KR",       # ...and as the symbol; the table holds both
+    "MTC40F2047S1RC64BBZ",
+    "100-000001263-02",
+    "M321R8GA0BB0-CQKVS",
+])
+def test_part_numbers_the_inventory_actually_holds_are_accepted(client, stub_decoder, pn):
+    """One rejected part number in a 117-part sweep raised a page-wide error."""
+    stub_decoder()
+    resp = client.get(f"/api/lookup-pn/{pn}")
+    assert resp.status_code == 200, f"{pn} was refused"
+
+
+@pytest.mark.parametrize("bad", ["x%3Fy", "a%20b", "x%26y", "%2E%2E"])
+def test_parentheses_did_not_open_the_door_to_url_steering(client, stub_decoder, bad):
+    stub_decoder()
+    assert client.get(f"/api/lookup-pn/{bad}").status_code == 400
