@@ -2278,6 +2278,101 @@ def notify_checkout(body: CheckoutNotifyIn):
     return {"sent": sent, "skipped": skipped}
 
 
+class CheckinNotifyIn(BaseModel):
+    ids: list[str]
+    # Free-text recipients the admin typed into the Check In modal — not the
+    # items' own checkout_email, since the point is telling whoever asked to
+    # be told ("let me know when this comes back"), not the returning
+    # borrower.
+    emails: list[str]
+
+
+def _build_checkin_msg(to_addr: str, items_list: list[dict]) -> MIMEMultipart:
+    count = len(items_list)
+    subject = (
+        f"[FVDDR Lab Inventory] Checked in: {items_list[0].get('name', 'an item')}"
+        if count == 1
+        else f"[FVDDR Lab Inventory] {count} items checked in"
+    )
+
+    lines = ["Hi,\n"]
+    lines.append(
+        "The following item has been checked in and is available in the lab inventory:\n"
+        if count == 1
+        else f"The following {count} items have been checked in and are available in the lab inventory:\n"
+    )
+    for item in items_list:
+        lines.append(f"  Item    : {item.get('name', '—')}")
+        if item.get("part_number"):   lines.append(f"  Part No : {item['part_number']}")
+        if item.get("serial_number"): lines.append(f"  S/N     : {item['serial_number']}")
+        if item.get("location"):      lines.append(f"  Location: {item['location']}")
+        if item.get("tray"):          lines.append(f"  Tray    : {item['tray']}")
+        lines.append("")
+    lines.append("Thank you,\nFVDDR Inventory Admin")
+    body_text = "\n".join(lines)
+
+    rows_html = ""
+    for item in items_list:
+        sn  = f"<br><span style='color:#777;font-size:0.9em'>S/N: {_esc(item['serial_number'])}</span>" if item.get("serial_number") else ""
+        pn  = f"<br><span style='color:#777;font-size:0.9em'>PN: {_esc(item['part_number'])}</span>"    if item.get("part_number")  else ""
+        loc = _esc(item.get("location") or "—")
+        rows_html += (
+            f"<tr style='border-top:1px solid #e0e0e0'>"
+            f"<td style='padding:6px 16px 6px 0;font-weight:bold'>{_esc(item.get('name','—'))}{sn}{pn}</td>"
+            f"<td style='padding:6px 0;color:#555'>Location: {loc}</td>"
+            f"</tr>"
+        )
+    intro = (
+        "The following item has"
+        if count == 1
+        else f"The following {count} items have"
+    )
+    body_html = (
+        f"<p>Hi,</p>"
+        f"<p>{intro} been checked in and {'is' if count == 1 else 'are'} available in the lab inventory:</p>"
+        f"<table style='border-collapse:collapse;margin:8px 0'>{rows_html}</table>"
+        f"<p>Thank you,<br>FVDDR Inventory Admin</p>"
+    )
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"]    = f"{SMTP_FROM_NAME} <{SMTP_FROM}>" if SMTP_FROM_NAME else SMTP_FROM
+    msg["To"]      = to_addr
+    msg.attach(MIMEText(body_text, "plain"))
+    msg.attach(MIMEText(body_html, "html"))
+    return msg
+
+
+@app.post("/api/items/notify-checkin", dependencies=[Depends(_require_admin)])
+def notify_checkin(body: CheckinNotifyIn):
+    """Tell whoever the admin lists that the given items are back, listing
+    name/part/serial/location for each. Best-effort, like notify_checkout —
+    a failed email must not turn an already-successful check-in into an
+    error, and this runs after the check-in itself has already been saved.
+    """
+    emails = [e.strip() for e in body.emails if e.strip()]
+    if not emails:
+        return {"sent": 0, "skipped": 0, "note": "No recipient addresses given"}
+    if not SMTP_HOST:
+        return {"sent": 0, "skipped": len(emails), "note": "SMTP not configured"}
+
+    all_items = _read()
+    id_set  = set(body.ids)
+    targets = [i for i in all_items if i["id"] in id_set]
+    if not targets:
+        return {"sent": 0, "skipped": len(emails), "note": "No matching items"}
+
+    sent = 0
+    for to_addr in emails:
+        try:
+            msg = _build_checkin_msg(to_addr, targets)
+            _smtp_send(to_addr, msg)
+            sent += 1
+        except Exception:
+            pass   # best-effort — don't fail the check-in if email breaks
+    return {"sent": sent, "skipped": len(emails) - sent}
+
+
 @app.post("/api/items/{item_id}/send-reminder", dependencies=[Depends(_require_superadmin)])
 def send_item_reminder(item_id: str, body: ReminderIn):
     items = _read()
@@ -2833,6 +2928,13 @@ _SHEET_COLS = [
     ("Condition",                       "condition",      12, False, False),
     ("Condition Note",                  "condition_note", 28, False, False),
     ("Location *",                      "location",       18, True,  False),
+    # Where a CPU or DIMM was last actually seen, written by a nightly scan
+    # (see run_audit_scan / run_dimm_audit_scan) — overwritten on every scan,
+    # so this always already is the latest sighting, not just the export's.
+    # Not in COL_ALIASES, so an uploaded sheet's Audit column (if any) is
+    # simply ignored on import rather than letting someone overwrite a scan's
+    # own record of where a part was actually seen.
+    ("Audit",                           "audit",          22, False, False),
     ("Tray / Comment",                  "tray",           18, False, False),
     ("Team *",                          "team",           16, True,  False),
     ("Owner *",                         "owner",          14, True,  False),
@@ -3006,6 +3108,18 @@ def download_bulk_template():
 
 class ExportIn(BaseModel):
     ids: list[str] | None = None
+    # Which _SHEET_COLS field keys to include, in their _SHEET_COLS order —
+    # None (the default) keeps every column a category normally gets, so an
+    # existing bookmark or script that never sends this is unaffected.
+    columns: list[str] | None = None
+
+
+@app.get("/api/export/columns")
+def export_columns():
+    """Every column the export can include, for the "choose columns" picker —
+    one list for the whole workbook; _cols_for_category still drops whichever
+    of these a given category never uses (RCD on a Storage sheet, say)."""
+    return {"columns": [{"key": key, "label": _export_label(label)} for label, key, *_ in _SHEET_COLS]}
 
 
 @app.post("/api/export")
@@ -3018,19 +3132,24 @@ def export_selected(body: ExportIn, creds: HTTPAuthorizationCredentials | None =
     server never sees it — whatever is in front rejects it first, which reaches
     the admin as "Export failed: Bad Gateway".
     """
-    return _export_workbook(body.ids, creds)
+    return _export_workbook(body.ids, creds, body.columns)
 
 
 @app.get("/api/export")
 def export_inventory(
     ids: list[str] | None = Query(default=None),
+    columns: list[str] | None = Query(default=None),
     creds: HTTPAuthorizationCredentials | None = Depends(bearer),
 ):
     """Kept for links and bookmarks; the UI posts a selection instead."""
-    return _export_workbook(ids, creds)
+    return _export_workbook(ids, creds, columns)
 
 
-def _export_workbook(ids: list[str] | None, creds: HTTPAuthorizationCredentials | None):
+def _export_workbook(
+    ids: list[str] | None,
+    creds: HTTPAuthorizationCredentials | None,
+    columns: list[str] | None = None,
+):
     # Exporting all items requires admin; exporting specific IDs is public (inventory is public)
     if not ids:
         _require_admin(creds)
@@ -3105,11 +3224,15 @@ def _export_workbook(ids: list[str] | None, creds: HTTPAuthorizationCredentials 
             if ids else "Nothing to export — the inventory is empty.",
         )
 
+    col_set = {c.strip() for c in columns if c.strip()} if columns else None
+
     wb = Workbook()
     wb.remove(wb.active)   # remove default blank sheet
     for cat in sorted_cats:
         ws   = wb.create_sheet(title=_safe_sheet_name(cat))
         cols = _cols_for_category(cat)
+        if col_set is not None:
+            cols = [c for c in cols if c[1] in col_set]
         _write_sheet(ws, groups[cat], cols)
 
     today  = _date.today().isoformat()

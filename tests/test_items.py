@@ -195,6 +195,73 @@ def test_export_of_everything_requires_admin(client):
     assert client.get("/api/export").status_code == 401
 
 
+def test_export_columns_lists_every_sheet_column(client):
+    """Open to everyone — it only names columns, carries no data — and is
+    the picker's one source of truth, shared with the server's own sheets."""
+    resp = client.get("/api/export/columns")
+    assert resp.status_code == 200
+    cols = resp.json()["columns"]
+    keys = {c["key"] for c in cols}
+    assert {"name", "part_number", "serial_number", "location", "notes"} <= keys
+    # Labelled for a filled-in sheet, not a blank form.
+    assert all("*" not in c["label"] for c in cols)
+
+
+def test_export_honors_a_chosen_column_subset(client, auth, make_item):
+    make_item(name="narrow export item", category="DIMMs", part_number="PN-NARROW")
+    resp = client.post("/api/export", json={
+        "ids": None, "columns": ["name", "part_number"],
+    }, headers=auth)
+    assert resp.status_code == 200, resp.text
+
+    parsed = client.post("/api/parse-file",
+                         files={"file": ("e.xlsx", resp.content, XLSX_MIME)},
+                         headers=auth)
+    assert parsed.status_code == 200
+    dimm_sheet = next(s for s in parsed.json()["sheets"] if s["name"] == "DIMMs")
+    header = dimm_sheet["rows"][0]
+    assert header == ["Item Description", "Part Number"]
+
+
+def test_export_audit_column_shows_the_latest_sighting(app_module, client, auth, make_item):
+    """Audit is overwritten (not appended to) on every scan, so whatever the
+    export shows is already the latest sighting — confirms that still holds
+    once Audit is actually picked for export."""
+    item = make_item(name="audited export item", category="DIMMs").json()
+    app_module._apply_audit_fields([item["id"]], "Eagle-0291 · 2026-11-02")
+    app_module._apply_audit_fields([item["id"]], "Eagle-0291 · 2026-11-04")   # the later scan
+
+    resp = client.post("/api/export", json={
+        "ids": None, "columns": ["name", "audit"],
+    }, headers=auth)
+    assert resp.status_code == 200, resp.text
+
+    parsed = client.post("/api/parse-file",
+                         files={"file": ("e.xlsx", resp.content, XLSX_MIME)},
+                         headers=auth)
+    dimm_sheet = next(s for s in parsed.json()["sheets"] if s["name"] == "DIMMs")
+    header = dimm_sheet["rows"][0]
+    assert header == ["Item Description", "Audit"]
+    row = next(r for r in dimm_sheet["rows"][1:] if r[0] == "audited export item")
+    assert row[1] == "Eagle-0291 · 2026-11-04"
+
+
+def test_export_with_no_columns_param_keeps_every_column(client, auth, make_item):
+    """Backward compatible: an old bookmark/script that never sends `columns`
+    must still get the full sheet it always did."""
+    make_item(name="full export item", category="DIMMs")
+    resp = client.post("/api/export", json={"ids": None}, headers=auth)
+    assert resp.status_code == 200
+
+    parsed = client.post("/api/parse-file",
+                         files={"file": ("e.xlsx", resp.content, XLSX_MIME)},
+                         headers=auth)
+    dimm_sheet = next(s for s in parsed.json()["sheets"] if s["name"] == "DIMMs")
+    header = dimm_sheet["rows"][0]
+    assert len(header) > 2
+    assert "Location" in header
+
+
 def test_csv_parsing(client, auth):
     csv_bytes = b"Item Description,Part Number\nWidget,PN-1\n"
     resp = client.post("/api/parse-file",

@@ -85,13 +85,25 @@
     .toolbar { display: flex; gap: 12px; margin-bottom: 10px; flex-wrap: wrap; align-items: center; }
     .toolbar-sel { display: none; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; align-items: center; }
     .toolbar-sel.has-selection { display: flex; }
-    .toolbar input[type="text"] {
+    .toolbar input[type="text"], .toolbar textarea#search {
       flex: 1; min-width: 180px; padding: 9px 14px;
       border: 1px solid var(--border2); border-radius: var(--radius);
       font-size: 0.9rem; background: var(--surface2); color: var(--text);
     }
-    .toolbar input[type="text"]::placeholder { color: var(--muted); }
-    .toolbar input[type="text"]:focus { outline: 2px solid var(--primary); border-color: transparent; }
+    .toolbar input[type="text"]::placeholder, .toolbar textarea#search::placeholder { color: var(--muted); }
+    .toolbar input[type="text"]:focus, .toolbar textarea#search:focus {
+      outline: 2px solid var(--primary); border-color: transparent;
+    }
+    /* One line until it holds more — pasting or scanning several barcodes,
+       one per line, grows it instead of silently collapsing them together
+       the way a plain <input> would. The drag handle lets you pull it open
+       further to see everything you pasted in, rather than scrolling a
+       fixed-height box to check it. */
+    .toolbar textarea#search {
+      font-family: inherit; line-height: 1.3; resize: vertical;
+      min-height: 38px; max-height: 400px; overflow-y: auto;
+    }
+    #search-group.hero textarea#search { line-height: 1.4; }
 
     button {
       cursor: pointer; border: none; border-radius: var(--radius);
@@ -1174,9 +1186,9 @@
     <!-- Grouped so the landing page can take the whole lot in one move, rather
          than relocating three elements and hoping they land back in order. -->
     <div id="search-group">
-      <input type="text" id="search" oninput="onSearchInput()"
-             placeholder="Search name, part no., serial, vendor, location, team, owner, borrower…"
-             title="Searches item description, part number, serial number, vendor, category, location, tray, team, owner, borrower, RCD, PMIC and condition." />
+      <textarea id="search" oninput="onSearchInput()" rows="1"
+             placeholder="Search name, part no., serial, vendor, location, team, owner, borrower… (scan or paste several, one per line)"
+             title="Searches item description, part number, serial number, vendor, category, location, tray, team, owner, borrower, RCD, PMIC and condition. Paste or scan several values, one per line, to search for all of them at once."></textarea>
       <span id="result-count" style="font-size:0.8rem;color:var(--muted);white-space:nowrap"></span>
       <input type="text" id="scan" placeholder="&#128278; Scan a label…" autocomplete="off"
              onkeydown="if(event.key==='Enter'){event.preventDefault();onScan();}"
@@ -1197,7 +1209,7 @@
   <div class="toolbar-sel" id="toolbar-sel">
     <button class="btn-export" id="export-btn" onclick="exportSelectedXlsx()">&#11015; Export Selected (<span id="export-count">0</span>)</button>
     <button class="btn-checkout-sel" id="checkout-sel-btn" onclick="openCheckoutBatch()">&#128722; Check Out Selected (<span id="checkout-sel-count">0</span>)</button>
-    <button class="btn-checkin-sel" id="checkin-sel-btn" onclick="checkInSelected()">&#8626; Check In Selected (<span id="checkin-sel-count">0</span>)</button>
+    <button class="btn-checkin-sel" id="checkin-sel-btn" onclick="openCheckinBatch()">&#8626; Check In Selected (<span id="checkin-sel-count">0</span>)</button>
     <button class="btn-return-req" id="return-req-btn" onclick="openReturnRequestModal()">&#9993; Request Return (<span id="return-req-count">0</span>)</button>
     <button class="btn-mark-bad" id="mark-bad-btn" onclick="markSelectedCondition('Bad')" title="Record these as faulty, with a reason">&#9888; Mark Bad (<span id="mark-bad-count">0</span>)</button>
     <button class="btn-mark-suspect" id="mark-suspect-btn" onclick="markSelectedCondition('Suspect')" title="Failed once, needs retesting">&#10068; Mark Suspect (<span id="mark-suspect-count">0</span>)</button>
@@ -1616,6 +1628,55 @@
   </div>
 </div>
 
+<!-- Check In modal -->
+<div class="overlay" id="checkin-overlay">
+  <div class="modal" style="max-width:500px;padding:0;overflow:hidden">
+    <!-- Header accent -->
+    <div style="background:linear-gradient(135deg,#16a34a,#15803d);padding:20px 24px 16px;color:#fff">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+        <span style="font-size:1.3rem">&#8626;</span>
+        <h2 style="margin:0;font-size:1.1rem;font-weight:700;color:#fff">Check In Item</h2>
+      </div>
+      <p id="checkin-modal-subtitle" style="margin:0;font-size:0.8rem;opacity:0.85;word-break:break-word;line-height:1.4"></p>
+    </div>
+    <!-- Body -->
+    <div style="padding:20px 24px">
+      <!-- Where it's going section -->
+      <p style="font-size:0.72rem;font-weight:700;letter-spacing:0.07em;color:var(--muted);text-transform:uppercase;margin-bottom:10px">Where it's going</p>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:18px">
+        <div>
+          <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:4px;color:var(--text)">Location</label>
+          <input type="text" id="ci-location" placeholder="e.g. L6-L12-03" style="width:100%" />
+        </div>
+        <div>
+          <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:4px;color:var(--text)">Tray / Comment</label>
+          <input type="text" id="ci-tray" placeholder="e.g. Tray 4" style="width:100%" />
+        </div>
+      </div>
+      <div style="font-size:0.72rem;color:var(--muted);margin:-12px 0 18px">
+        Checking in more than one item at once leaves a blank field unchanged on each
+        — only what you type here replaces it.
+      </div>
+      <!-- Notes section -->
+      <p style="font-size:0.72rem;font-weight:700;letter-spacing:0.07em;color:var(--muted);text-transform:uppercase;margin-bottom:10px">Notes <span style="font-weight:400;text-transform:none;font-size:0.72rem">(optional)</span></p>
+      <textarea id="ci-notes" rows="3" placeholder="e.g. Checked, no visible damage" style="width:100%;resize:vertical;min-height:64px;margin-bottom:18px"></textarea>
+      <!-- Notify section -->
+      <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:4px;color:var(--text)">
+        Notify by email <span style="font-weight:400;color:var(--muted)">(optional — separate multiple emails with commas)</span>
+      </label>
+      <input type="text" id="ci-notify-email" placeholder="e.g. manager@amd.com, nextuser@amd.com" style="width:100%" />
+      <div style="font-size:0.72rem;color:var(--muted);margin-top:3px">
+        Sends a short "this item is back and available" email to whoever you list here.
+      </div>
+    </div>
+    <!-- Footer -->
+    <div style="padding:14px 24px;border-top:1px solid var(--border);background:var(--surface2);display:flex;justify-content:flex-end;gap:10px">
+      <button class="btn-ghost" onclick="closeCheckinModal()">Cancel</button>
+      <button class="btn-primary" onclick="doCheckin()" style="background:#16a34a;border-color:#16a34a">&#10003; Confirm Check In</button>
+    </div>
+  </div>
+</div>
+
 <div class="overlay" id="delete-overlay">
   <div class="modal" style="max-width:360px">
     <h2>Delete Item</h2>
@@ -1677,6 +1738,35 @@
     <div style="padding:14px 24px;border-top:1px solid var(--border);background:var(--surface2);display:flex;justify-content:flex-end;gap:10px">
       <button class="btn-ghost" onclick="closeReturnRequestModal()">Cancel</button>
       <button class="btn-primary" id="rr-send-btn" onclick="submitReturnRequest()" style="background:#9333ea">&#9993; Send Request</button>
+    </div>
+  </div>
+</div>
+
+<!-- Choose export columns modal -->
+<div class="overlay" id="export-cols-overlay">
+  <div class="modal" style="max-width:420px;padding:0;overflow:hidden">
+    <div style="background:linear-gradient(135deg,#1d4ed8,#1e40af);padding:20px 24px 16px;color:#fff">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+        <span style="font-size:1.3rem">&#11015;&#65039;</span>
+        <h2 style="margin:0;font-size:1.1rem;font-weight:700;color:#fff">Choose Export Columns</h2>
+      </div>
+      <p id="export-cols-subtitle" style="margin:0;font-size:0.8rem;opacity:0.85;line-height:1.4"></p>
+    </div>
+    <div style="padding:16px 24px">
+      <div style="display:flex;gap:14px;margin-bottom:10px;font-size:0.8rem">
+        <a href="#" onclick="_setAllExportCols(true); return false" style="color:var(--primary)">Select all</a>
+        <a href="#" onclick="_setAllExportCols(false); return false" style="color:var(--primary)">Select none</a>
+      </div>
+      <div id="export-cols-list" style="max-height:320px;overflow-y:auto;border:1px solid var(--border);
+           border-radius:6px;padding:8px 14px;background:var(--surface2)"></div>
+      <p style="font-size:0.72rem;color:var(--muted);margin:8px 0 0">
+        A category sheet still only gets the columns it actually uses — unchecking Location
+        here still applies even though Storage never had RCD/PMIC to begin with.
+      </p>
+    </div>
+    <div style="padding:14px 24px;border-top:1px solid var(--border);background:var(--surface2);display:flex;justify-content:flex-end;gap:10px">
+      <button class="btn-ghost" onclick="closeExportColsModal()">Cancel</button>
+      <button class="btn-primary" onclick="confirmExportCols()" style="background:#1d4ed8;border-color:#1d4ed8">&#11015; Export</button>
     </div>
   </div>
 </div>
@@ -3247,7 +3337,12 @@
   }
 
   function renderTable() {
-    const q = document.getElementById('search').value.toLowerCase().trim();
+    // One search term per non-blank line, so pasting or scanning several
+    // barcodes at once (each containing its own internal spaces) searches
+    // for all of them rather than one mangled, unmatchable string — a plain
+    // single-line input collapses pasted newlines away before this ever runs.
+    const searchTerms = document.getElementById('search').value
+      .split('\n').map(s => s.trim().toLowerCase()).filter(Boolean);
     filtered = [...items];
 
     if (activeFilter !== 'All') filtered = filtered.filter(i => (i.category || '') === activeFilter);
@@ -3268,13 +3363,18 @@
               .every(f => !String(i[f] || '').trim()));
       }
     }
-    if (q) filtered = filtered.filter(i => searchBlob(i).includes(q));
+    if (searchTerms.length) {
+      filtered = filtered.filter(i => {
+        const blob = searchBlob(i);
+        return searchTerms.some(t => blob.includes(t));
+      });
+    }
 
     // Whether anything is narrowing the view. Two jobs: it tells the empty
     // state the difference between "there is nothing here" and "nothing matches
     // what you typed", and it decides whether this screen shows the landing
     // page or the table.
-    const narrowed = !!q || activeFilter !== 'All'
+    const narrowed = searchTerms.length > 0 || activeFilter !== 'All'
                      || !!activeLocation || !!activePart || !!activeDetail;
 
     // Admins keep the table up front — their work starts by selecting rows, and
@@ -3439,7 +3539,7 @@
           ? `<td class="col-check"><input type="checkbox" ${selected ? 'checked' : ''} onclick="toggleSelect('${item.id}', this)" /></td>`
           : '';
         const holdBtn = item.checkout_user
-          ? `<button class="btn-return" onclick="doQuickReturn('${item.id}')">&#8626; Check In</button>`
+          ? `<button class="btn-return" onclick="openCheckinModal('${item.id}')">&#8626; Check In</button>`
           : `<button class="btn-checkout" onclick="openCheckoutModal('${item.id}')">&#128722; Check Out</button>`;
         const actionsTd = showRowControls
           ? `<td><div class="actions">${holdBtn}`
@@ -3521,50 +3621,107 @@
     if (inner && table) inner.style.width = table.scrollWidth + 'px';
   }
 
-  async function doQuickReturn(id) {
-    const item = items.find(i => i.id === id);
-    if (!item || !confirm(`Return "${item.name}" from ${item.checkout_user}?`)) return;
-    try {
-      const body = { ...item };
-      body.checkout_user  = '';
-      body.checkout_email = '';
-      body.checkout_date  = '';
-      body.loan_until     = '';
-      delete body.id; delete body.createdAt; delete body.updatedAt; delete body.modified_by;
-      const updated = await putItem(item, body);
-      items[items.findIndex(i => i.id === id)] = updated;
-      renderTable();
-      showToast(`"${item.name}" returned successfully.`);
-    } catch { /* error shown in banner */ }
+  // ── Check In modal ───────────────────────────────────────────────────────
+  //
+  // Twin of the Check Out modal below: where it's going (location/tray),
+  // notes, and an optional "let someone know it's back" email — rather than
+  // the bare confirm() dialogs this replaced, which cleared the loan fields
+  // and nothing else.
+
+  let checkinTargetIds = [];
+
+  function _openCheckinModal(ids) {
+    const validIds = ids.filter(id => { const it = items.find(i => i.id === id); return it && !!it.checkout_user; });
+    if (!validIds.length) return;
+    checkinTargetIds = validIds;
+
+    if (validIds.length === 1) {
+      const item = items.find(i => i.id === validIds[0]);
+      document.getElementById('checkin-modal-subtitle').textContent =
+        `${item?.name || ''} — returning from ${item?.checkout_user || 'unknown'}`;
+      document.getElementById('ci-location').value = item?.location || '';
+      document.getElementById('ci-tray').value     = item?.tray || '';
+      document.getElementById('ci-notes').value    = item?.notes || '';
+    } else {
+      const names = validIds.map(id => items.find(i => i.id === id)?.name).filter(Boolean);
+      document.getElementById('checkin-modal-subtitle').textContent = `${validIds.length} items: ${names.join(', ')}`;
+      document.getElementById('ci-location').value = '';
+      document.getElementById('ci-tray').value     = '';
+      document.getElementById('ci-notes').value    = '';
+    }
+    document.getElementById('ci-notify-email').value = '';
+    document.getElementById('checkin-overlay').classList.add('open');
+    document.getElementById('ci-location').focus();
   }
 
-  async function checkInSelected() {
+  function openCheckinModal(id) { _openCheckinModal([id]); }
+
+  function openCheckinBatch() {
     const pool = allFilteredSelected ? filtered.map(i => i.id) : [...selectedIds];
     const ids = pool.filter(id => { const it = items.find(i => i.id === id); return it && !!it.checkout_user; });
     if (ids.length === 0) return;
-    const names = ids.map(id => items.find(i => i.id === id)?.name).filter(Boolean);
-    const msg = ids.length === 1
-      ? `Check in "${names[0]}"?`
-      : `Check in ${ids.length} items?\n\n${names.join('\n')}`;
-    if (!confirm(msg)) return;
+    _openCheckinModal(ids);
+  }
+
+  function closeCheckinModal() {
+    document.getElementById('checkin-overlay').classList.remove('open');
+    checkinTargetIds = [];
+  }
+
+  async function doCheckin() {
+    if (checkinTargetIds.length === 0) return;
+
+    const location  = document.getElementById('ci-location').value.trim();
+    const tray      = document.getElementById('ci-tray').value.trim();
+    const notes     = document.getElementById('ci-notes').value.trim();
+    const notifyRaw = document.getElementById('ci-notify-email').value.trim();
+    const notifyEmails = notifyRaw ? notifyRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+    for (const e of notifyEmails) {
+      if (!/^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$/.test(e)) { alert(`"${e}" is not a valid email address.`); return; }
+    }
+
+    // Checking in several items at once can't meaningfully prefill one
+    // location/tray/notes for all of them, so a field left blank there means
+    // "leave each item's own value alone" rather than "clear it" — which is
+    // exactly what a single item's prefilled, then possibly edited, field
+    // already means by being blank.
+    const isBatch = checkinTargetIds.length > 1;
+    const applyField = (current, typed) => (!isBatch || typed) ? typed : (current || '');
+
     try {
-      for (const id of ids) {
+      const names = [];
+      for (const id of checkinTargetIds) {
         const item = items.find(i => i.id === id);
         if (!item) continue;
+        names.push(item.name);
         const body = { ...item };
         body.checkout_user  = '';
         body.checkout_email = '';
         body.checkout_date  = '';
         body.loan_until     = '';
+        body.location = applyField(item.location, location);
+        body.tray     = applyField(item.tray, tray);
+        body.notes    = applyField(item.notes, notes);
         delete body.id; delete body.createdAt; delete body.updatedAt; delete body.modified_by;
         const updated = await putItem(item, body);
         items[items.findIndex(i => i.id === id)] = updated;
       }
+      const count = checkinTargetIds.length;
+      const targetIds = checkinTargetIds.slice();
+      closeCheckinModal();
       selectedIds.clear();
       allFilteredSelected = false;
       resetScanCount();
       renderTable();
-      showToast(ids.length === 1 ? `"${names[0]}" checked in.` : `${ids.length} items checked in.`);
+      showToast(count === 1 ? `"${names[0]}" checked in.` : `${count} items checked in.`);
+
+      // Best-effort, non-blocking — the check-in itself already succeeded.
+      if (notifyEmails.length) {
+        apiFetch('/api/items/notify-checkin', {
+          method: 'POST', body: JSON.stringify({ ids: targetIds, emails: notifyEmails }), quiet: true,
+        }).then(r => { if (r.sent > 0) showToast(`Check-in notification sent to ${r.sent} recipient(s).`); })
+          .catch(() => {});
+      }
     } catch { /* error shown in banner */ }
   }
 
@@ -4887,21 +5044,18 @@
     showToast(`Exported ${toExport.length} item${toExport.length !== 1 ? 's' : ''}.`);
   }
 
-  async function _doExportXlsx(ids) {
+  async function _doExportXlsx(ids, columns) {
     try {
-      const isSelected = ids && ids.length > 0;
       const headers = {};
       if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
-      // A selection goes in the body. As a query string it was one
-      // `ids=<32 hex>` per item — 349 KB of URL for the whole table, which
+      // Always POST, selection or not — as a query string a selection was one
+      // `ids=<32 hex>` per item, 349 KB of URL for the whole table, which
       // never reached the server and came back as "Bad Gateway".
-      const res = isSelected
-        ? await fetch('/api/export', {
-            method: 'POST',
-            headers: { ...headers, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ ids }),
-          })
-        : await fetch('/api/export', { headers });
+      const res = await fetch('/api/export', {
+        method: 'POST',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: ids || null, columns: columns || null }),
+      });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         showToast('Export failed: ' + (err.detail || res.statusText), true);
@@ -4951,8 +5105,71 @@
     }
   }
 
-  function exportAllXlsx()      { _doExportXlsx(null); }
-  function exportSelectedXlsx() { _doExportXlsx(allFilteredSelected ? filtered.map(i => i.id) : [...selectedIds]); }
+  // ── "choose columns" before exporting ───────────────────────────────────
+  //
+  // The export's own column list, not the table's visibility picker (COLUMNS
+  // above): the export is split one sheet per category and carries fields
+  // the table never shows at all (Action, Notes, Check Out Email…), so it
+  // needs its own source of truth — /api/export/columns, built from the same
+  // _SHEET_COLS the server already writes sheets from.
+
+  let _exportColumnDefs = null;   // [{key, label}], fetched once and cached
+  let _exportTargetIds  = null;   // null = everything; an array = a selection
+
+  async function _loadExportColumnDefs() {
+    if (_exportColumnDefs) return _exportColumnDefs;
+    const data = await apiFetch('/api/export/columns', { quiet: true });
+    _exportColumnDefs = data.columns;
+    return _exportColumnDefs;
+  }
+
+  function _loadChosenExportCols(allKeys) {
+    try {
+      const saved = JSON.parse(localStorage.getItem('inv_export_cols') || 'null');
+      if (Array.isArray(saved)) {
+        const known = new Set(allKeys);
+        const kept = saved.filter(k => known.has(k));
+        if (kept.length) return new Set(kept);
+      }
+    } catch {}
+    return new Set(allKeys);   // default: everything, matching today's export
+  }
+
+  async function _openExportColsModal(ids) {
+    _exportTargetIds = ids;
+    const defs = await _loadExportColumnDefs();
+    const chosen = _loadChosenExportCols(defs.map(c => c.key));
+    const n = ids ? ids.length : items.length;
+    document.getElementById('export-cols-subtitle').textContent =
+      `${n} item${n !== 1 ? 's' : ''} — choose which columns to include.`;
+    document.getElementById('export-cols-list').innerHTML = defs.map(c => `
+      <label style="display:block;padding:4px 0;font-size:0.88rem;cursor:pointer">
+        <input type="checkbox" data-export-col="${c.key}" ${chosen.has(c.key) ? 'checked' : ''} />
+        ${esc(c.label)}
+      </label>`).join('');
+    document.getElementById('export-cols-overlay').classList.add('open');
+  }
+
+  function _setAllExportCols(checked) {
+    document.querySelectorAll('#export-cols-list input[type="checkbox"]')
+      .forEach(chk => { chk.checked = checked; });
+  }
+
+  function closeExportColsModal() {
+    document.getElementById('export-cols-overlay').classList.remove('open');
+  }
+
+  function confirmExportCols() {
+    const checked = [...document.querySelectorAll('#export-cols-list input[type="checkbox"]:checked')]
+      .map(chk => chk.dataset.exportCol);
+    if (!checked.length) { alert('Choose at least one column.'); return; }
+    localStorage.setItem('inv_export_cols', JSON.stringify(checked));
+    closeExportColsModal();
+    _doExportXlsx(_exportTargetIds, checked);
+  }
+
+  function exportAllXlsx()      { _openExportColsModal(null); }
+  function exportSelectedXlsx() { _openExportColsModal(allFilteredSelected ? filtered.map(i => i.id) : [...selectedIds]); }
 
   async function deleteSelected() {
     const ids = allFilteredSelected ? filtered.map(i => i.id) : [...selectedIds];

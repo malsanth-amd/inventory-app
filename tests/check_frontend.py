@@ -33,6 +33,7 @@ EXPECTED_FUNCTIONS = [
     "_findCpuBySerial", "_recordSutAudit", "openAuditHistory", "closeAuditHistory",
     "readSutDimms", "clearDimmDecoder", "_dimmResults", "_dimmInventoryPanel", "_recordDimmAudit",
     "exportAuditLog",
+    "openCheckinModal", "openCheckinBatch", "closeCheckinModal", "doCheckin",
     "runAuditScanNow", "loadLastAuditScanRun", "runDimmScanNow", "loadLastDimmScanRun",
     "_renderScanRunSummary",
     "landingAggregates", "renderLanding", "renderLandingStock", "applyFacet",
